@@ -1,19 +1,19 @@
 [submodule "services/connection-manager"]
 	path = services/connection-manager
-	url = https://github.com/dimasjanee11/connection-manager.git
-	branch = master
+	url = git@github.com:revarewerd/connection-manager.git
+	branch = main
 [submodule "services/device-manager"]
 	path = services/device-manager
-	url = https://github.com/dimasjanee11/device-manager.git
+	url = git@github.com:revarewerd/device-manager.git
 [submodule "services/history-writer"]
 	path = services/history-writer
-	url = https://github.com/dimasjanee11/history-writer.git
+	url = git@github.com:revarewerd/history-writer.git
 [submodule "services/web-frontend"]
 	path = services/web-frontend
-	url = git@github-dimasjanee11:dimasjanee11/web-frontend.git
+	url = git@github.com:revarewerd/web-frontend.git
 [submodule "services/web-billing"]
 	path = services/web-billing
-	url = git@github-dimasjanee11:dimasjanee11/web-billing.git
+	url = git@github.com:revarewerd/web-billing.git
 [submodule "services/API-Gateway"]
 	path = services/API-Gateway
-	url = git@github-dimasjanee11:dimasjanee11/api-gateway.git
+	url = git@github.com:revarewerd/api-gateway.git
