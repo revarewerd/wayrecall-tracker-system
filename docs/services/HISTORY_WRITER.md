@@ -3,7 +3,8 @@
 > **Блок:** 1 (Data Collection)  
 > **Порт:** HTTP 8091 (admin/metrics)  
 > **Сложность:** Средняя  
-> **Статус:** 🟡 В разработке
+> **Статус:** � Требует переписывания (ClickHouse → TimescaleDB)  
+> **Обновлено:** 12 февраля 2026
 
 ---
 
@@ -1070,5 +1071,90 @@ def writeBatchCopy(points: Chunk[GpsPoint]): Task[Int] = ZIO.attempt {
 
 ---
 
-**Дата:** 26 января 2026  
-**Статус:** Документация готова ✅
+## ⚠️ КРИТИЧЕСКОЕ: Переписать TelemetryRepository на TimescaleDB
+
+### Текущее состояние
+
+Весь `TelemetryRepository.scala` написан для ClickHouse JDBC:
+- Используется `com.clickhouse.jdbc.ClickHouseDriver`
+- SQL с ClickHouse-специфичными функциями (`count()`, `geoDistance`, `lagInFrame`)
+- HikariCP настроен на ClickHouse
+
+### Что нужно сделать
+
+1. **build.sbt** — заменить `clickhouse-jdbc` на:
+   ```scala
+   "org.postgresql"  %  "postgresql"    % "42.7.1"
+   "org.tpolecat"   %% "doobie-core"   % "1.0.0-RC5"
+   "org.tpolecat"   %% "doobie-hikari" % "1.0.0-RC5"
+   "dev.zio"        %% "zio-interop-cats" % "23.1.0.0"
+   ```
+
+2. **TelemetryRepository.scala** — переписать на Doobie:
+   - `insertBatch` → Doobie `Update[GpsPoint].updateMany` с таблицей `gps_points` (hypertable)
+   - `getByVehicle` → стандартный PostgreSQL SQL
+   - `getLastPoint` → `ORDER BY timestamp DESC LIMIT 1`
+   - `getDailyStats` → TimescaleDB `time_bucket('1 day', timestamp)`
+   - `countByVehicle` → `COUNT(*)` (не ClickHouse `count()`)
+
+3. **AppConfig.scala** — заменить `ClickHouseConfig` на `PostgresConfig`:
+   ```scala
+   case class PostgresConfig(
+     host: String,
+     port: Int,
+     database: String,
+     username: String,
+     password: String,
+     poolSize: Int = 10
+   )
+   ```
+
+4. **Errors.scala** — заменить `ClickHouseError` на `DatabaseError`
+
+### Пример: insertBatch на Doobie
+
+```scala
+import doobie.*
+import doobie.implicits.*
+import zio.interop.catz.*
+
+def insertBatch(batch: TelemetryBatch): IO[HistoryError, Int] =
+  val sql = """
+    INSERT INTO gps_points (
+      device_id, imei, timestamp, server_time,
+      lat, lon, speed, course, altitude,
+      satellites, hdop, valid, protocol, io_data
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb)
+    ON CONFLICT (timestamp, device_id) DO NOTHING
+  """
+  Update[TelemetryRow](sql)
+    .updateMany(batch.toRows)
+    .transact(transactor)
+    .mapError(e => DatabaseError(e.getMessage))
+```
+
+### Пример: getDailyStats на TimescaleDB
+
+```scala
+def getDailyStats(vehicleId: VehicleId, from: Instant, to: Instant) =
+  sql"""
+    SELECT
+      time_bucket('1 day', timestamp) AS day,
+      COUNT(*) AS point_count,
+      MAX(speed) AS max_speed,
+      AVG(speed) AS avg_speed
+    FROM gps_points
+    WHERE device_id = $vehicleId
+      AND timestamp >= $from
+      AND timestamp <= $to
+    GROUP BY day
+    ORDER BY day ASC
+  """.query[DailyStats].to[List]
+    .transact(transactor)
+    .mapError(e => DatabaseError(e.getMessage))
+```
+
+---
+
+**Дата:** 12 февраля 2026  
+**Статус:** Требует переписывания ClickHouse → TimescaleDB/Doobie ⚠️

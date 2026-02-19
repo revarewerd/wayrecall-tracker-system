@@ -6,7 +6,7 @@ services:
     image: redis:7-alpine
     container_name: tracker-redis
     ports:
-      - "6379:6379"
+      - "16379:6379"
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes
@@ -15,6 +15,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - tracker-network
 
   # Kafka - Event streaming
   kafka:
@@ -38,6 +40,8 @@ services:
       interval: 5s
       timeout: 10s
       retries: 5
+    networks:
+      - tracker-network
 
   # ZooKeeper - для Kafka
   zookeeper:
@@ -48,13 +52,15 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    networks:
+      - tracker-network
 
   # TimescaleDB - GPS история
   timescaledb:
-    image: timescale/timescaledb-ha:latest-pg15
+    image: timescale/timescaledb:latest-pg16
     container_name: tracker-timescaledb
     ports:
-      - "5432:5432"
+      - "15432:5432"
     environment:
       POSTGRES_DB: tracker
       POSTGRES_USER: tracker
@@ -62,48 +68,174 @@ services:
       POSTGRES_INITDB_ARGS: "-c max_connections=200 -c shared_buffers=256MB"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./scripts/init-timescaledb.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./infra/postgresql/init-docker.sql:/docker-entrypoint-initdb.d/01-init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tracker"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - tracker-network
 
-  # Prometheus - мониторинг (опционально)
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: tracker-prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-
-  # Grafana - дашборды (опционально)
-  grafana:
-    image: grafana/grafana:latest
-    container_name: tracker-grafana
-    ports:
-      - "3000:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin123
-      GF_SECURITY_ADMIN_USER: admin
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./monitoring/grafana-dashboards:/etc/grafana/provisioning/dashboards
-      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+  # ============================================================
+  # Connection Manager - 4 экземпляра на разных протоколах
+  # ============================================================
+  
+  connection-manager-teltonika:
+    build:
+      context: ./services/connection-manager
+      dockerfile: Dockerfile
+    container_name: tracker-cm-teltonika
     depends_on:
-      - prometheus
+      - kafka
+      - redis
+    ports:
+      - "5001:5001"
+      - "8081:8080"
+    environment:
+      INSTANCE_ID: "cm-instance-1"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      TCP_ENABLED_PROTOCOLS: "teltonika"
+    networks:
+      - tracker-network
+    restart: unless-stopped
+  
+  connection-manager-wialon:
+    build:
+      context: ./services/connection-manager
+      dockerfile: Dockerfile
+    container_name: tracker-cm-wialon
+    depends_on:
+      - kafka
+      - redis
+    ports:
+      - "5002:5002"
+      - "8082:8080"
+    environment:
+      INSTANCE_ID: "cm-instance-2"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      TCP_ENABLED_PROTOCOLS: "wialon"
+    networks:
+      - tracker-network
+    restart: unless-stopped
+  
+  connection-manager-ruptela:
+    build:
+      context: ./services/connection-manager
+      dockerfile: Dockerfile
+    container_name: tracker-cm-ruptela
+    depends_on:
+      - kafka
+      - redis
+    ports:
+      - "5003:5003"
+      - "8083:8080"
+    environment:
+      INSTANCE_ID: "cm-instance-3"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      TCP_ENABLED_PROTOCOLS: "ruptela"
+    networks:
+      - tracker-network
+    restart: unless-stopped
+  
+  connection-manager-navtelecom:
+    build:
+      context: ./services/connection-manager
+      dockerfile: Dockerfile
+    container_name: tracker-cm-navtelecom
+    depends_on:
+      - kafka
+      - redis
+    ports:
+      - "5004:5004"
+      - "8084:8080"
+    environment:
+      INSTANCE_ID: "cm-instance-4"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      TCP_ENABLED_PROTOCOLS: "navtelecom"
+    networks:
+      - tracker-network
+    restart: unless-stopped
+  
+  # ============================================================
+  # Device Manager - REST API для управления устройствами
+  # ============================================================
+  
+  device-manager:
+    build:
+      context: ./services/device-manager
+      dockerfile: Dockerfile
+    container_name: tracker-device-manager
+    depends_on:
+      - timescaledb
+      - kafka
+      - redis
+    ports:
+      - "8092:8082"
+    environment:
+      APP_HTTP_PORT: "8082"
+      APP_DATABASE_HOST: "timescaledb"
+      APP_DATABASE_PORT: "5432"
+      APP_DATABASE_NAME: "tracker"
+      APP_DATABASE_USERNAME: "tracker"
+      APP_DATABASE_PASSWORD: "tracker123"
+      APP_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      APP_REDIS_HOST: "redis"
+      APP_REDIS_PORT: "6379"
+    networks:
+      - tracker-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  
+  # ============================================================
+  # History Writer - Запись GPS событий в TimescaleDB
+  # ============================================================
+  
+  history-writer:
+    build:
+      context: ./services/history-writer
+      dockerfile: Dockerfile
+    container_name: tracker-history-writer
+    depends_on:
+      - timescaledb
+      - kafka
+    ports:
+      - "8093:8083"
+    environment:
+      APP_HTTP_PORT: "8083"
+      APP_DATABASE_HOST: "timescaledb"
+      APP_DATABASE_PORT: "5432"
+      APP_DATABASE_NAME: "tracker"
+      APP_DATABASE_USERNAME: "tracker"
+      APP_DATABASE_PASSWORD: "tracker123"
+      APP_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      APP_BATCH_MAX_SIZE: "500"
+      APP_BATCH_FLUSH_INTERVAL_MS: "5000"
+    networks:
+      - tracker-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   redis-data:
   pgdata:
-  prometheus-data:
-  grafana-data:
 
 networks:
-  default:
-    name: tracker-network
+  tracker-network:
+    driver: bridge

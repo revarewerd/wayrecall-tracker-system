@@ -1,47 +1,104 @@
 #!/bin/bash
-# Создание Kafka топиков для TrackerGPS
-# Использование: ./infra/scripts/create-kafka-topics.sh
+
+# ============================================================
+# Создание Kafka топиков для Wayrecall Tracker
+# ============================================================
+# 
+# Запуск: ./create-kafka-topics.sh
+# Предварительно должен быть запущен Kafka
+# ============================================================
 
 set -e
 
-echo "📊 Создание Kafka топиков..."
+KAFKA_HOST="${KAFKA_HOST:-localhost:9092}"
+REPLICATION_FACTOR="${REPLICATION_FACTOR:-1}"
 
-# Переменные
-KAFKA_CONTAINER="tracker-kafka"
-PARTITIONS=12
-REPLICATION_FACTOR=1
+echo "🚀 Создание Kafka топиков для Wayrecall Tracker..."
+echo "   Kafka: $KAFKA_HOST"
+echo "   Replication Factor: $REPLICATION_FACTOR"
+echo ""
 
 # Функция создания топика
 create_topic() {
-    local topic=$1
-    local partitions=${2:-$PARTITIONS}
-    
-    echo "  Создание топика: $topic (partitions=$partitions)..."
-    
-    docker exec $KAFKA_CONTAINER kafka-topics.sh \
-        --create \
-        --if-not-exists \
-        --bootstrap-server localhost:9092 \
-        --topic $topic \
-        --partitions $partitions \
-        --replication-factor $REPLICATION_FACTOR \
-        --config retention.ms=604800000 \
-        --config compression.type=lz4
+  local TOPIC=$1
+  local PARTITIONS=$2
+  local RETENTION_MS=$3
+  
+  echo "📝 Создание топика: $TOPIC (partitions=$PARTITIONS, retention=${RETENTION_MS}ms)"
+  
+  kafka-topics --create \
+    --bootstrap-server "$KAFKA_HOST" \
+    --topic "$TOPIC" \
+    --partitions "$PARTITIONS" \
+    --replication-factor "$REPLICATION_FACTOR" \
+    --config retention.ms="$RETENTION_MS" \
+    --config compression.type=snappy \
+    --if-not-exists || echo "   ⚠️  Топик $TOPIC уже существует"
 }
 
-# Основные топики
-create_topic "gps-events" 12           # GPS данные с устройств (12 партиций для 10K устройств)
-create_topic "device-commands" 6        # Команды на устройства
-create_topic "geozone-events" 6         # События геозон (въезд/выезд)
-create_topic "notifications" 3          # Уведомления пользователям
-create_topic "device-status" 6          # Статусы устройств (online/offline)
-create_topic "unknown-devices" 3        # Попытки подключения неизвестных устройств
-create_topic "gps-events-unverified" 6  # DLQ для точек без проверки (Redis недоступен)
+# ============================================================
+# БЛОК 1: Connection Manager + History Writer + Device Manager
+# ============================================================
+
+# GPS события (основной поток данных)
+# 12 партиций для высокой пропускной способности (10k+ точек/сек)
+# 7 дней retention (604800000 ms)
+create_topic "gps-events" 12 604800000
+
+# GPS события с геозонами (для Rule Checker и Geozones Service)
+# 6 партиций (меньше нагрузка, только точки с привязкой к геозонам)
+# 7 дней retention
+create_topic "gps-events-rules" 6 604800000
+
+# GPS события для ретрансляции (Wialon, EGTS, HTTP)
+# 6 партиций
+# 7 дней retention
+create_topic "gps-events-retranslation" 6 604800000
+
+# Статусы устройств (online/offline)
+# 6 партиций (по deviceId для ordering)
+# 7 дней retention
+create_topic "device-status" 6 604800000
+
+# Команды для трекеров (Static Partition Assignment)
+# 6 партиций (каждый CM instance читает свою партицию через assign())
+# 7 дней retention
+create_topic "device-commands" 6 604800000
+
+# CRUD события устройств (для синхронизации)
+# 3 партиции (низкая частота изменений)
+# 30 дней retention (2592000000 ms)
+create_topic "device-events" 3 2592000000
+
+# Неизвестные устройства (авто-регистрация)
+# 3 партиции
+# 7 дней retention
+create_topic "unknown-devices" 3 604800000
+
+# GPS точки от незарегистрированных трекеров (для последующей регистрации)
+# 6 партиций (partition key = imei)
+# 30 дней retention (2592000000 ms)
+create_topic "unknown-gps-events" 6 2592000000
+
+# Аудит команд (логирование всех команд и результатов)
+# 3 партиции (по deviceId для ordering)
+# 90 дней retention (7776000000 ms)
+create_topic "command-audit" 3 7776000000
+
+# ============================================================
+# БЛОК 2: Geozones Service (Post-MVP)
+# ============================================================
+
+# События геозон (вход/выход)
+# 6 партиций (по vehicleId)
+# 30 дней retention
+create_topic "geozone-events" 6 2592000000
 
 echo ""
-echo "✅ Все топики созданы!"
+echo "✅ Все топики созданы успешно!"
 echo ""
-echo "Список топиков:"
-docker exec $KAFKA_CONTAINER kafka-topics.sh \
-    --list \
-    --bootstrap-server localhost:9092
+echo "📋 Проверка топиков:"
+kafka-topics --list --bootstrap-server "$KAFKA_HOST" | grep -E "(gps|device|command|geozone|unknown)" || true
+echo ""
+echo "🎯 Для просмотра конфигурации топика:"
+echo "   kafka-topics --describe --bootstrap-server $KAFKA_HOST --topic gps-events"

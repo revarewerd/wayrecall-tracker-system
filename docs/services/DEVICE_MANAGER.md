@@ -3,7 +3,8 @@
 > **Блок:** 1 (Data Collection)  
 > **Порт:** HTTP 8092 (REST API)  
 > **Сложность:** Средняя  
-> **Статус:** 🟡 В разработке
+> **Статус:** 🟡 В разработке  
+> **Обновлено:** 12 февраля 2026
 
 ---
 
@@ -30,7 +31,7 @@
 | Параметр | Значение |
 |----------|----------|
 | **Вход** | REST API, Kafka (device-status) |
-| **Выход** | Redis (commands), Kafka (command-audit) |
+| **Выход** | Kafka (device-commands, command-audit, device-events) |
 | **База данных** | PostgreSQL |
 | **Кеш** | Redis |
 | **Роль** | CRUD устройств, отправка команд |
@@ -68,8 +69,9 @@ flowchart TB
 
     subgraph Kafka["Kafka"]
         DS[device-status]
+        DC[device-commands]
         CA[command-audit]
-        CR[command-responses]
+        DE[device-events]
     end
 
     subgraph CM["Connection Manager"]
@@ -80,14 +82,14 @@ flowchart TB
     REST --> CmdSvc & DevSvc & StatusSvc
 
     DevSvc --> PG
-    CmdSvc --> Redis
+    DevSvc --> Redis
+    DevSvc --> DE
+    CmdSvc --> DC
     CmdSvc --> CA
     StatusSvc --> PG & Redis
 
     DS --> StatusSvc
-    CR --> CmdSvc
-
-    Redis -.->|Pub/Sub| CMI
+    DC -->|Static Partition| CMI
 ```
 
 ### Компоненты
@@ -96,7 +98,7 @@ flowchart TB
 |-----------|----------|------------|
 | **REST API** | HTTP endpoints | ZIO HTTP |
 | **Device Service** | CRUD операции | Doobie |
-| **Command Service** | Отправка команд | Redis Pub/Sub |
+| **Command Service** | Отправка команд через Kafka | zio-kafka (device-commands) |
 | **Status Service** | Online/Offline статус | Kafka Consumer |
 
 ---
@@ -459,42 +461,43 @@ components:
 sequenceDiagram
     participant U as User/API
     participant DM as Device Manager
-    participant R as Redis
-    participant CM as Connection Manager
-    participant T as Tracker
+    participant PG as PostgreSQL
     participant K as Kafka
+    participant CM as Connection Manager
+    participant R as Redis
+    participant T as Tracker
 
     U->>DM: POST /devices/123/commands<br/>{command: "setdigout", params: {out: 1}}
     
     DM->>DM: Validate command
-    DM->>DM: Generate requestId
-    DM->>K: Publish command-audit (pending)
+    DM->>DM: Generate commandId
+    DM->>PG: Get device (protocol, imei)
+    PG-->>DM: {protocol: "teltonika", imei: "860719..."}
     
-    DM->>R: HGET connection_registry {imei}
+    DM->>DM: Resolve instanceId by protocol<br/>(teltonika → cm-instance-1)
+    DM->>K: Publish device-commands<br/>key=cm-instance-1 → partition 0
+    DM->>K: Publish command-audit (pending)
+    DM-->>U: 202 Accepted {commandId, status: "pending"}
+    
+    Note over K,CM: CM читает partition 0<br/>(kafkaConsumer.assign)
+    K-->>CM: Command message
     
     alt Трекер онлайн
-        R-->>DM: instance_id = "cm-2"
-        DM->>R: PUBLISH commands:cm-2 {command}
-        DM-->>U: 202 Accepted {requestId, status: "sent"}
-        
-        R-->>CM: Command message
         CM->>T: Send command (protocol-specific)
         T-->>CM: Response
-        CM->>R: PUBLISH command-responses {response}
-        R-->>DM: Response
-        DM->>K: Publish command-audit (success)
+        CM->>K: Publish command-audit (success)
         
     else Трекер оффлайн
-        R-->>DM: null (not connected)
-        DM->>R: ZADD pending_commands:{imei} {timestamp} {command}
-        DM-->>U: 202 Accepted {requestId, status: "pending"}
-        DM->>K: Publish command-audit (queued)
+        CM->>CM: Add to in-memory queue
+        CM->>R: ZADD pending_commands:{imei} (backup)
+        CM->>K: Publish command-audit (queued)
         
         Note over R,T: Позже, когда трекер подключится...
         T->>CM: Connect
-        CM->>R: ZPOPMIN pending_commands:{imei}
-        R-->>CM: {command}
-        CM->>T: Send command
+        CM->>CM: Merge in-memory + Redis<br/>Deduplicate by commandId
+        CM->>T: Send all pending commands
+        CM->>CM: Clear in-memory queue
+        CM->>R: DEL pending_commands:{imei}
     end
 ```
 
@@ -533,9 +536,9 @@ trait CommandService {
 }
 
 class CommandServiceImpl(
-  redis: RedisClient,
   kafka: KafkaProducer,
-  deviceRepo: DeviceRepository
+  deviceRepo: DeviceRepository,
+  protocolMapping: ProtocolInstanceMapping
 ) extends CommandService {
   
   def sendCommand(
@@ -554,12 +557,12 @@ class CommandServiceImpl(
       ZIO.fail(UnsupportedCommand(command, device.protocol))
     }
     
-    // 3. Сгенерировать requestId
-    requestId <- Random.nextUUID
+    // 3. Сгенерировать commandId
+    commandId <- Random.nextUUID
     
     // 4. Создать сообщение команды
     cmdMsg = CommandMessage(
-      requestId = requestId,
+      commandId = commandId,
       imei = device.imei,
       command = command,
       params = params,
@@ -567,32 +570,19 @@ class CommandServiceImpl(
       createdAt = Instant.now()
     )
     
-    // 5. Записать в audit log
+    // 5. Определить instanceId по протоколу (статический маппинг)
+    instanceId = protocolMapping.resolve(device.protocol)
+    // teltonika → cm-instance-1, wialon → cm-instance-2, ...
+    
+    // 6. Отправить в Kafka device-commands (key = instanceId → static partition)
+    _ <- kafka.publish("device-commands", instanceId, cmdMsg.toJson)
+    
+    // 7. Записать в audit log
     _ <- kafka.publish("command-audit", cmdMsg.toAuditEvent("pending"))
     
-    // 6. Проверить онлайн ли устройство
-    instanceOpt <- redis.hget("connection_registry", device.imei)
-    
-    status <- instanceOpt match {
-      case Some(instanceId) =>
-        // Устройство онлайн — отправляем команду
-        for {
-          _ <- redis.publish(s"commands:$instanceId", cmdMsg.toJson)
-          _ <- kafka.publish("command-audit", cmdMsg.toAuditEvent("sent"))
-        } yield CommandStatus(requestId, deviceId, command, "sent")
-        
-      case None =>
-        // Устройство оффлайн — в очередь
-        for {
-          _ <- redis.zadd(
-            s"pending_commands:${device.imei}",
-            System.currentTimeMillis().toDouble,
-            cmdMsg.toJson
-          )
-          _ <- kafka.publish("command-audit", cmdMsg.toAuditEvent("queued"))
-        } yield CommandStatus(requestId, deviceId, command, "pending")
-    }
-  } yield status
+    // DM не знает онлайн ли трекер — это решает CM
+    // CM сам положит в in-memory + Redis если оффлайн
+  } yield CommandStatus(commandId, deviceId, command, "pending")
 }
 ```
 
@@ -774,32 +764,15 @@ GROUP BY organization_id;
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  📨 ОЧЕРЕДЬ КОМАНД ДЛЯ ОФФЛАЙН УСТРОЙСТВ                             │
+│  📨 ОЧЕРЕДЬ КОМАНД ДЛЯ ОФФЛАЙН УСТРОЙСТВ (управляет CM)              │
 │  ─────────────────────────────────────────────────────────────────  │
 │  Key:     pending_commands:{imei}                                   │
+│  Owner:   Connection Manager (backup для in-memory очереди)        │
 │  Type:    ZSET (sorted set)                                         │
 │  Score:   timestamp (для FIFO)                                      │
 │  TTL:     24 часа                                                   │
 │  Value:   JSON команды                                              │
-│  Example: ZADD pending_commands:860719020025346 1706270400 '{...}'  │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  🔄 СТАТУС КОМАНД (для polling)                                      │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Key:     command_status:{requestId}                                │
-│  Type:    HASH                                                      │
-│  TTL:     1 час                                                     │
-│  Fields:  status, response, error, completedAt                     │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  📢 PUB/SUB: ОТВЕТЫ НА КОМАНДЫ                                       │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Channel: command-responses                                         │
-│  Subscriber: Device Manager                                         │
-│  Publisher: Connection Manager                                      │
-│  Message:  {requestId, status, response, error}                    │
+│  Note:    DM НЕ пишет сюда — только CM при оффлайн трекере         │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -900,51 +873,40 @@ case class SyncReport(
 )
 ```
 
-### Обработка ответов на команды
+### Обработка результатов команд
+
+> **Примечание:** DM **не** слушает ответы от CM напрямую. CM сам пишет результаты в `command-audit` (Kafka).
+> Для отображения статуса команд API делает запрос в PostgreSQL (через `command_history` таблицу),
+> или подписывается на `command-audit` Consumer для обновления таблицы.
 
 ```scala
-object CommandResponseHandler {
+// DM потребляет command-audit для обновления PostgreSQL
+object CommandAuditConsumer {
   
   def run(
-    redis: RedisClient,
-    commandRepo: CommandRepository,
-    kafka: KafkaProducer
-  ): ZIO[Any, Throwable, Unit] = {
+    commandRepo: CommandRepository
+  ): ZStream[Consumer, Throwable, Unit] = {
     
-    redis
-      .subscribe("command-responses")
-      .mapZIO { message =>
+    Consumer
+      .subscribeAnd(Subscription.topics("command-audit"))
+      .plainStream(Serde.string, Serde.string)
+      .mapZIO { record =>
         for {
-          response <- ZIO.fromEither(message.as[CommandResponse])
+          event <- ZIO.fromEither(record.value.fromJson[CommandAuditEvent])
           
-          // Обновить статус в Redis (для быстрого polling)
-          _ <- redis.hset(
-            s"command_status:${response.requestId}",
-            Map(
-              "status" -> response.status,
-              "response" -> response.response.getOrElse(""),
-              "error" -> response.error.getOrElse(""),
-              "completedAt" -> Instant.now().toString
-            )
-          )
-          _ <- redis.expire(s"command_status:${response.requestId}", 1.hour)
-          
-          // Обновить в PostgreSQL
+          // Обновить статус в PostgreSQL
           _ <- commandRepo.updateStatus(
-            response.requestId,
-            response.status,
-            response.response,
-            response.error
+            event.commandId,
+            event.status,       // pending → sent → success/failed/queued
+            event.response,
+            event.error
           )
-          
-          // Записать в audit log
-          _ <- kafka.publish("command-audit", response.toAuditEvent)
-          
         } yield ()
       }
-      .runDrain
+      .map(_.offset)
   }
 }
+```
 ```
 
 ---
@@ -956,8 +918,9 @@ object CommandResponseHandler {
 | Топик | Роль | Описание |
 |-------|------|----------|
 | `device-status` | Consumer | Online/offline события от CM |
+| `device-commands` | Producer | Команды для CM (key=instanceId, Static Partition) |
 | `command-audit` | Producer | Лог всех команд |
-| `command-responses` | — | Через Redis Pub/Sub |
+| `device-events` | Producer | CRUD события (создание/удаление устройств) |
 
 ### Device Status Consumer
 
@@ -986,42 +949,13 @@ object DeviceStatusConsumer {
           // Обновить кеш
           _ <- redis.hset(s"device:imei:${event.imei}", "status", event.status)
           
-          // Если устройство подключилось — отправить pending команды
-          _ <- ZIO.when(event.status == "online") {
-            processPendingCommands(event.imei, redis)
-          }
+          // Pending команды обрабатывает CM автоматически при подключении трекера
+          // (merge in-memory + Redis, deduplicate by commandId)
           
           _ <- record.offset.commit
         } yield ()
       }
   }
-  
-  private def processPendingCommands(
-    imei: String,
-    redis: RedisClient
-  ): Task[Unit] = for {
-    // Получить все pending команды
-    commands <- redis.zrangeByScore(
-      s"pending_commands:$imei",
-      0,
-      System.currentTimeMillis().toDouble
-    )
-    
-    // Получить instance, на котором подключено устройство
-    instanceOpt <- redis.hget("connection_registry", imei)
-    
-    _ <- instanceOpt match {
-      case Some(instanceId) =>
-        ZIO.foreachDiscard(commands) { cmdJson =>
-          for {
-            _ <- redis.publish(s"commands:$instanceId", cmdJson)
-            _ <- redis.zrem(s"pending_commands:$imei", cmdJson)
-          } yield ()
-        }
-      case None =>
-        ZIO.logWarning(s"Device $imei went offline before pending commands sent")
-    }
-  } yield ()
 }
 ```
 
@@ -1029,12 +963,12 @@ object DeviceStatusConsumer {
 
 ```scala
 case class CommandAuditEvent(
-  requestId: UUID,
+  commandId: UUID,
   deviceId: Long,
   imei: String,
   command: String,
   params: Option[JsonObject],
-  status: String,
+  status: String,        // pending → sent → success/failed/queued
   response: Option[String],
   error: Option[String],
   userId: Long,
@@ -1218,7 +1152,7 @@ services:
 - **HTTP:** zio-http (REST API)
 - **PostgreSQL:** Quill или Doobie
 - **Redis:** zio-redis
-- **Kafka:** zio-kafka (producer)
+- **Kafka:** zio-kafka (producer + consumer)
 - **JSON:** zio-json
 - **Конфигурация:** zio-config + HOCON
 - **Метрики:** zio-metrics + Prometheus
@@ -1229,15 +1163,16 @@ services:
 ### Основные компоненты:
 1. **REST API** — CRUD для устройств, групп, команд
 2. **Device Repository** — PostgreSQL операции
-3. **Redis Client** — кеш, статусы, очередь команд
-4. **Kafka Producer** — audit log команд
-5. **Command Queue** — очередь команд для устройств
+3. **Redis Client** — кеш, статусы устройств
+4. **Kafka Producer** — device-commands (команды), command-audit (лог), device-events (CRUD)
+5. **ProtocolInstanceMapping** — маппинг protocol → instanceId
 
 ### Flow управления командами:
 ```
-REST API → Validate → Save to Redis Queue → Kafka Audit
-                              ↓
-Connection Manager reads queue → Send to device → ACK → Update status
+REST API → Validate → Resolve instanceId → Kafka device-commands (key=instanceId)
+                                                    ↓
+CM reads own partition (assign) → Online? Send → Kafka command-audit
+                                  Offline? In-memory + Redis backup
 ```
 
 ## ТРЕБОВАНИЯ К РЕАЛИЗАЦИИ
@@ -1523,7 +1458,7 @@ object DeviceApi:
 9. ✅ OpenAPI спецификация
 
 ## ЗАВИСИМОСТИ ОТ ДРУГИХ СЕРВИСОВ
-- **Connection Manager** — пишет статус в Redis, читает команды
+- **Connection Manager** — читает device-commands из Kafka (Static Partition), пишет device-status и command-audit
 - **Auth Service** — валидация JWT токенов
 ```
 
@@ -1531,5 +1466,127 @@ object DeviceApi:
 
 ---
 
-**Дата:** 26 января 2026  
-**Статус:** Документация готова ✅
+## ⚠️ Доработки: Пропущенные настройки из legacy Stels
+
+### Аудит полей (Stels → Wayrecall)
+
+В legacy Stels было 3 коллекции: `objects` (ТС), `equipments` (трекеры), `accounts` (организации).  
+Часть полей уже покрыта в `Entities.scala`, но некоторые отсутствуют.
+
+### Сущность Device — пропущенные поля из Stels `Equipment`
+
+| Поле Stels | Описание | Статус в Wayrecall |
+|-----------|----------|-------------------|
+| `eqIMEI` | IMEI устройства | ✅ `imei: Imei` |
+| `eqMark` | Марка устройства | ❌ Отсутствует, добавить `deviceBrand: Option[String]` |
+| `eqModel` | Модель устройства | ❌ Отсутствует, добавить `deviceModel: Option[String]` |
+| `eqSerNum` | Серийный номер | ❌ Отсутствует, добавить `serialNumber: Option[String]` |
+| `eqFirmware` | Версия прошивки | ✅ `firmwareVersion: Option[String]` |
+| `eqLogin` | Логин устройства | ❌ Отсутствует, добавить `deviceLogin: Option[String]` |
+| `eqPass` | Пароль устройства | ❌ Отсутствует, добавить `devicePassword: Option[String]` |
+| `eqtype` | Тип оборудования | ❌ Отсутствует |
+| `eqOwner` | Владелец | ❌ Не нужно (= organizationId) |
+| `eqWork` | Статус работы | ✅ `status: DeviceStatus` |
+| `simNumber` | Номер SIM | ✅ `phoneNumber: Option[String]` |
+| `simOwner` | Владелец SIM | ❌ Не критично для MVP |
+| `simProvider` | Оператор | ❌ Добавить `simProvider: Option[String]` |
+| `simICCID` | ICCID SIM | ❌ Добавить `simIccid: Option[String]` |
+
+### Сущность Vehicle — пропущенные поля из Stels `Object`
+
+| Поле Stels | Описание | Статус в Wayrecall |
+|-----------|----------|-------------------|
+| `name` | Название | ✅ `name: String` |
+| `marka` | Марка ТС | ✅ `brand: Option[String]` |
+| `model` | Модель ТС | ✅ `model: Option[String]` |
+| `gosnumber` | Гос. номер | ✅ `licensePlate: Option[String]` |
+| `VIN` | VIN-код | ✅ `vin: Option[String]` |
+| `type` | Тип объекта | ✅ `vehicleType: VehicleType` |
+| `comment` | Комментарий | ❌ Добавить `comment: Option[String]` |
+| `fuelPumpLock` | Блокировка насоса | ❌ Post-MVP (команды управления) |
+| `ignitionLock` | Блокировка зажигания | ❌ Post-MVP (команды управления) |
+| `disabled` | Отключён | ✅ Через `DeviceStatus.Inactive` |
+| `subscriptionfee` | Абонплата | ❌ Block 3 (Billing) |
+
+### Сущность Organization — пропущенные поля из Stels `Account`
+
+| Поле Stels | Описание | Статус в Wayrecall |
+|-----------|----------|-------------------|
+| `name` | Название | ✅ `name: String` |
+| `fullClientName` | Полное имя | ❌ Добавить `fullName: Option[String]` |
+| `accountType` | Тип аккаунта | ❌ Не нужно (у нас фиксированная модель) |
+| `plan` | Тарифный план | ❌ Block 3 (Billing) |
+| `status` | Статус | ✅ `isActive: Boolean` |
+| `balance` | Баланс | ❌ Block 3 (Billing) |
+| `contractCount` | Кол-во контрактов | ❌ Block 3 (Billing) |
+
+### Ретрансляция — отдельная сущность
+
+В Stels ретрансляция хранилась в JSON-файле. В Wayrecall нужна сущность в БД:
+
+```scala
+/**
+ * Цель ретрансляции — внешний сервер куда пересылаются GPS данные
+ */
+final case class RetranslationTarget(
+  id: Long,
+  organizationId: OrganizationId,
+  name: String,
+  protocol: RetranslationProtocol, // WialonIps, Nis, Custom
+  host: String,
+  port: Int,
+  isActive: Boolean,
+  vehicleIds: List[VehicleId],    // к каким ТС привязана ретрансляция
+  createdAt: Instant,
+  updatedAt: Instant
+) derives JsonCodec
+
+enum RetranslationProtocol derives JsonCodec:
+  case WialonIps  // текстовый, TCP (как в Stels)
+  case Egts       // российский транспортный стандарт
+  case Custom     // HTTP API (JSON)
+```
+
+**Stels слал обработанную точку** (не бинарь) — формировал текстовый пакет Wialon IPS из GPSData и отправлял на внешний сервер по TCP. NIS и ODS — через HTTP/SOAP.
+
+### План добавления полей (MVP)
+
+**Добавить в Device:**
+```scala
+deviceBrand: Option[String],      // марка трекера (eqMark)
+deviceModel: Option[String],      // модель трекера (eqModel)
+serialNumber: Option[String],     // серийный номер (eqSerNum)
+simProvider: Option[String],      // оператор SIM
+simIccid: Option[String],         // ICCID SIM
+```
+
+**Добавить в Vehicle:**
+```scala
+comment: Option[String],          // примечание
+```
+
+**Добавить в Organization:**
+```scala
+fullName: Option[String],         // полное название
+```
+
+**Добавить отдельную таблицу:**
+```sql
+CREATE TABLE retranslation_targets (
+  id SERIAL PRIMARY KEY,
+  organization_id INTEGER NOT NULL REFERENCES organizations(id),
+  name VARCHAR(100) NOT NULL,
+  protocol VARCHAR(20) NOT NULL,  -- wialon_ips, egts, custom
+  host VARCHAR(255) NOT NULL,
+  port INTEGER NOT NULL,
+  is_active BOOLEAN DEFAULT true,
+  vehicle_ids INTEGER[] NOT NULL, -- привязанные ТС
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+---
+
+**Дата:** 12 февраля 2026  
+**Статус:** Документация обновлена, необходимо дополнить Entities.scala и миграции ✅

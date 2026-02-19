@@ -1,0 +1,63 @@
+# ============================================================
+# Prometheus Configuration — Wayrecall Tracker Test Stand
+# ============================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+# Правила (можно добавить позже)
+# rule_files:
+#   - "rules/*.yml"
+
+scrape_configs:
+  # Сам Prometheus
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Node Exporter — метрики хоста
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # Connection Managers — 4 инстанса (HTTP API /api/health и /api/metrics)
+  - job_name: 'connection-manager'
+    metrics_path: '/api/metrics'
+    static_configs:
+      - targets:
+          - 'connection-manager-teltonika:8080'
+          - 'connection-manager-wialon:8080'
+          - 'connection-manager-ruptela:8080'
+          - 'connection-manager-navtelecom:8080'
+        labels:
+          service: 'connection-manager'
+    # Если /api/metrics недоступен — пинговать health
+    scrape_interval: 30s
+
+  # Device Manager
+  - job_name: 'device-manager'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['device-manager:8082']
+        labels:
+          service: 'device-manager'
+
+  # History Writer
+  - job_name: 'history-writer'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['history-writer:8083']
+        labels:
+          service: 'history-writer'
+
+  # Redis (через redis exporter, если добавим)
+  # - job_name: 'redis'
+  #   static_configs:
+  #     - targets: ['redis-exporter:9121']
+
+  # Kafka (через JMX exporter, если добавим)
+  # - job_name: 'kafka'
+  #   static_configs:
+  #     - targets: ['kafka:7071']

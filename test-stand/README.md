@@ -14,7 +14,8 @@
 ### Доступ
 - **Hostname:** freenaumen
 - **SSH:** `wogulis@192.168.1.5`
-- **SSH Alias:** `ssh server`
+- **SSH Port:** 2220
+- **SSH Alias:** `ssh server` (порт 2220 настроен в ~/.ssh/config)
 - **SSH Key:** id_ed25519 (настроен)
 
 ### Операционная система
@@ -52,13 +53,22 @@ nano test-stand/.env  # Настроить пароли
 
 После развертывания доступны:
 
-| Сервис | URL | Credentials |
-|--------|-----|-------------|
-| Grafana | http://192.168.1.5:3000 | admin / см. .env |
-| Prometheus | http://192.168.1.5:9090 | - |
-| Kafka UI | http://192.168.1.5:8080 | - |
-| PostgreSQL | 192.168.1.5:5432 | tracker / см. .env |
-| Redis | 192.168.1.5:6379 | - |
+| Сервис | URL/Порт | Описание |
+|--------|----------|----------|
+| **Главная** | http://192.168.1.5 (порт 80) | Nginx reverse proxy |
+| **Web Frontend** | http://192.168.1.5:3001 | Пользовательская панель |
+| **Web Billing** | http://192.168.1.5:3002 | Админка |
+| **Device Manager** | http://192.168.1.5:8092 | REST API |
+| **History Writer** | http://192.168.1.5:8093 | Batch GPS writer |
+| **CM Teltonika** | 192.168.1.5:5001 (TCP) | GPS протокол |
+| **CM Wialon** | 192.168.1.5:5002 (TCP) | GPS протокол |
+| **CM Ruptela** | 192.168.1.5:5003 (TCP) | GPS протокол |
+| **CM NavTelecom** | 192.168.1.5:5004 (TCP) | GPS протокол |
+| Grafana | http://192.168.1.5:3000 | Мониторинг |
+| Prometheus | http://192.168.1.5:9090 | Метрики |
+| PostgreSQL | 192.168.1.5:5432 | TimescaleDB |
+| Redis | 192.168.1.5:6379 | Кэш/очереди |
+| Kafka | 192.168.1.5:29092 | Внешний доступ |
 
 ---
 
@@ -100,12 +110,13 @@ test-stand/
 | Redis | 150MB | 5% | 1GB |
 | Kafka + ZooKeeper | 1.5GB | 15% | 10GB |
 | TimescaleDB | 600MB | 10% | 50GB+ |
-| Connection Manager | 500MB | 20% | 1GB |
-| History Writer | 500MB | 15% | 1GB |
-| Device Manager | 400MB | 10% | 1GB |
+| CM ×4 (Teltonika, Wialon, Ruptela, NavTelecom) | 4×512MB = 2GB | 20% | 1GB |
+| History Writer | 512MB | 15% | 1GB |
+| Device Manager | 512MB | 10% | 1GB |
+| Web Frontend + Web Billing + Nginx Proxy | 320MB | 3% | 0.5GB |
 | Prometheus | 200MB | 5% | 5GB |
 | Grafana | 150MB | 5% | 1GB |
-| **ИТОГО** | **~4GB** | **85%** | **70GB** |
+| **ИТОГО** | **~6GB** | **88%** | **70GB** |
 
 **Остаток:** 3.7GB RAM, 15% CPU, 30GB системный диск, 8.2TB RAID массив
 
@@ -117,7 +128,7 @@ test-stand/
 
 ```bash
 # На сервере
-sudo ufw allow 22/tcp        # SSH
+sudo ufw allow 2220/tcp      # SSH (порт 2220)
 sudo ufw allow 3000/tcp      # Grafana
 sudo ufw allow 9090/tcp      # Prometheus
 sudo ufw allow 5432/tcp      # PostgreSQL (только из локальной сети)
@@ -175,30 +186,30 @@ sudo ufw enable
 
 ```bash
 # Проверить статус Docker
-ssh server 'sudo systemctl status docker'
+ssh -p 2220 server 'sudo systemctl status docker'
 
 # Проверить логи
 ./test-stand/scripts/logs.sh
 
 # Перезапустить всё
-ssh server 'cd projects/wayrecall-tracker-system && docker compose -f test-stand/docker-compose.prod.yml restart'
+ssh -p 2220 server 'cd projects/wayrecall-tracker-system && docker compose -f test-stand/docker-compose.prod.yml restart'
 ```
 
 ### Нехватка памяти
 
 ```bash
 # Проверить использование
-ssh server 'free -h'
-ssh server 'docker stats --no-stream'
+ssh -p 2220 server 'free -h'
+ssh -p 2220 server 'docker stats --no-stream'
 
 # Очистить неиспользуемые образы
-ssh server 'docker system prune -a'
+ssh -p 2220 server 'docker system prune -a'
 ```
 
 ### RAID массив не смонтирован
 
 ```bash
-ssh server 'sudo mount /dev/md0 /mnt/raid'
+ssh -p 2220 server 'sudo mount /dev/md0 /mnt/raid'
 ```
 
 ---

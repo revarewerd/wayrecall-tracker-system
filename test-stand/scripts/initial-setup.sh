@@ -108,7 +108,7 @@ echo ""
 echo -e "${GREEN}[7/8]${NC} Настройка firewall..."
 if command -v ufw &> /dev/null; then
     sudo ufw --force enable
-    sudo ufw allow 22/tcp comment 'SSH'
+    sudo ufw allow 2220/tcp comment 'SSH'
     sudo ufw allow 3000/tcp comment 'Grafana'
     sudo ufw allow 9090/tcp comment 'Prometheus'
     sudo ufw allow from 192.168.1.0/24 to any port 5432 comment 'PostgreSQL local'

@@ -4,12 +4,13 @@
 set -e
 
 SERVER="wogulis@192.168.1.5"
+SSH_PORT=2220
 BACKUP_DATE=$(date +%Y-%m-%d_%H-%M-%S)
 BACKUP_NAME="tracker_backup_${BACKUP_DATE}.tar.gz"
 
 echo "🔄 Создание backup: $BACKUP_NAME"
 
-ssh $SERVER << ENDSSH
+ssh -p $SSH_PORT $SERVER << ENDSSH
 set -e
 
 BACKUP_DIR="/mnt/raid/backups"

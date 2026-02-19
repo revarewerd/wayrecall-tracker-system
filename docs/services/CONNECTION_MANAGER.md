@@ -4,7 +4,7 @@
 > **Порты:** TCP (один порт на инстанс, задаётся через CLI/env), HTTP 8090 (admin/metrics)  
 > **Сложность:** Высокая  
 > **Статус:** 🟡 В разработке  
-> **Обновлено:** 4 февраля 2026
+> **Обновлено:** 12 февраля 2026
 
 ---
 
@@ -16,11 +16,13 @@
 4. [Архитектура компонентов](#архитектура-компонентов)
 5. [Протоколы трекеров](#протоколы-трекеров)
 6. [Обработка данных](#обработка-данных)
-7. [Redis интеграция](#redis-интеграция)
-8. [Kafka интеграция](#kafka-интеграция)
-9. [API endpoints](#api-endpoints)
-10. [Масштабирование](#масштабирование)
-11. [Метрики и мониторинг](#метрики-и-мониторинг)
+7. [Типизированные ошибки парсинга (ADT)](#типизированные-ошибки-парсинга-adt)
+8. [Redis интеграция](#redis-интеграция)
+9. [Kafka интеграция](#kafka-интеграция)
+10. [API endpoints](#api-endpoints)
+11. [Масштабирование](#масштабирование)
+12. [Метрики и мониторинг](#метрики-и-мониторинг)
+13. [Post-MVP: GPS спуфинг-фильтр](#post-mvp-gps-спуфинг-фильтр)
 
 ---
 
@@ -37,7 +39,7 @@
 | **Пропускная способность** | 10,000+ точек/сек на инстанс |
 | **Latency** | < 50ms (parse → Kafka) |
 | **Concurrent connections** | 3,000+ на инстанс |
-| **State** | Redis (без локального состояния) |
+| **State** | Redis (кеш) + in-memory (pending commands) |
 
 ---
 
@@ -106,7 +108,8 @@
 │     ┌─────────────────────────────────────────────────────────────┐     │
 │     │ 2.3 ENRICH                                                  │     │
 │     │     raw + context → GpsPoint                                │     │
-│     │     (vehicleId, orgId, speedLimit, hasGeozones, ...)        │     │
+│     │     (vehicleId, orgId, speedLimit, hasGeozones,             │     │
+│     │      hasRetranslation, retranslationTargets, ...)           │     │
 │     └─────────────────────────────────────────────────────────────┘     │
 │                                       ↓                                 │
 │     ┌─────────────────────────────────────────────────────────────┐     │
@@ -130,6 +133,10 @@
 │     │                                                             │     │
 │     │     → gps-events-rules (если hasGeozones OR hasSpeedRules)  │     │
 │     │       Consumers: Geozones Service, Speed Alert Service      │     │
+│     │                                                             │     │
+│     │     → gps-events-retranslation (если hasRetranslation)      │     │
+│     │       Consumers: Integration Service                        │     │
+│     │       (retranslationTargets встраиваются в сообщение)       │     │
 │     │                                                             │     │
 │     └─────────────────────────────────────────────────────────────┘     │
 │                                       ↓                                 │
@@ -291,7 +298,9 @@ flowchart TB
 | **Stationary Filter** | Определение движение/стоянка | Pure Scala |
 | **Data Enricher** | Добавление метаданных | Pure Scala |
 | **Kafka Producer** | Публикация в топики | zio-kafka |
-| **Redis Client** | Кеш позиций, registry | zio-redis |
+| **Kafka Consumer** | Получение команд (device-commands) | zio-kafka (Static Partition) |
+| **Command Handler** | Отправка команд на трекеры + pending queue | ZIO + Redis |
+| **Redis Client** | Кеш позиций, backup команд | zio-redis |
 
 ---
 
@@ -864,6 +873,8 @@ case class DeviceData(
   speedLimit: Option[Int],
   hasGeozones: Boolean,
   hasSpeedRules: Boolean,
+  hasRetranslation: Boolean,                    // Integration Service записывает в Redis
+  retranslationTargets: Option[List[String]],   // ["wialon-0", "webhook-1"] — цели ретрансляции
   fuelTankVolume: Option[Double],
   sensorConfig: Option[SensorConfig],
   
@@ -901,6 +912,10 @@ object DeviceData:
       speedLimit = hash.get("speedLimit").filter(_.nonEmpty).flatMap(_.toIntOption),
       hasGeozones = hash.get("hasGeozones").contains("true"),
       hasSpeedRules = hash.get("hasSpeedRules").contains("true"),
+      hasRetranslation = hash.get("hasRetranslation").contains("true"),
+      retranslationTargets = hash.get("retranslationTargets")
+        .filter(_.nonEmpty)
+        .map(_.split(",").toList),
       fuelTankVolume = hash.get("fuelTankVolume").flatMap(_.toDoubleOption),
       sensorConfig = hash.get("sensorConfig").flatMap(_.fromJson[SensorConfig].toOption),
       
@@ -944,11 +959,14 @@ object DeviceData:
 
 ### Топики
 
-| Топик | Партиции | Retention | Условие публикации | Consumers |
-|-------|----------|-----------|-------------------|-----------|
-| `gps-events` | 12 | 7 дней | **ВСЕ** валидные точки | History Writer, WebSocket Service |
-| `gps-events-rules` | 6 | 1 день | `hasGeozones=true` OR `hasSpeedRules=true` | Geozones Service, Speed Alert Service |
-| `device-status` | 3 | 30 дней | Connect/Disconnect | Notifications Service, History Writer |
+| Топик | Партиции | Retention | Условие публикации | Роль CM |
+|-------|----------|-----------|-------------------|---------|
+| `gps-events` | 12 | 7 дней | **ВСЕ** валидные точки | **Producer** |
+| `gps-events-rules` | 6 | 1 день | `hasGeozones=true` OR `hasSpeedRules=true` | **Producer** |
+| `gps-events-retranslation` | 6 | 1 день | `hasRetranslation=true` | **Producer** |
+| `device-status` | 3 | 30 дней | Connect/Disconnect | **Producer** |
+| `device-commands` | 6 | 7 дней | — | **Consumer** (Static Partition Assignment) |
+| `command-audit` | 3 | 90 дней | Результат выполнения команды | **Producer** |
 
 ### Логика публикации
 
@@ -962,6 +980,12 @@ def publishToKafka(point: GpsPoint): Task[Unit] =
     // 2. Если есть правила — дублируем в топик для проверок
     _ <- ZIO.when(point.hasGeozones || point.hasSpeedRules)(
            kafkaProducer.publish("gps-events-rules", point.vehicleId.toString, point.toJson)
+         )
+    
+    // 3. Если есть ретрансляция — в топик для Integration Service
+    //    retranslationTargets уже встроены в GpsPoint, consumer не делает lookup в БД
+    _ <- ZIO.when(point.hasRetranslation)(
+           kafkaProducer.publish("gps-events-retranslation", point.vehicleId.toString, point.toJson)
          )
   yield ()
 ```
@@ -991,9 +1015,11 @@ case class GpsPoint(
   serverTime: Instant,
   
   // Флаги из контекста (для downstream сервисов)
-  speedLimit: Option[Int],        // Geozones Service проверит превышение
-  hasGeozones: Boolean,           // Маркер для фильтрации
-  hasSpeedRules: Boolean,         // Маркер для фильтрации
+  speedLimit: Option[Int],                     // Geozones Service проверит превышение
+  hasGeozones: Boolean,                        // Маркер для фильтрации → gps-events-rules
+  hasSpeedRules: Boolean,                      // Маркер для фильтрации → gps-events-rules
+  hasRetranslation: Boolean,                   // Маркер для фильтрации → gps-events-retranslation
+  retranslationTargets: Option[List[String]],  // ["wialon-0", "webhook-1"] — цели без lookup в БД
   
   // Статус
   isMoving: Boolean,
@@ -1030,19 +1056,21 @@ case class DeviceStatusMessage(
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  Предположение: 30% машин имеют геозоны или правила скорости            │
+│  Предположение: 30% машин имеют геозоны/правила, 10% ретрансляцию       │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  10,000 точек/сек:                                                      │
-│  ├─ gps-events:       10,000 точек/сек (100%)                           │
-│  └─ gps-events-rules:  3,000 точек/сек (30%)                            │
+│  ├─ gps-events:              10,000 точек/сек (100%)                    │
+│  ├─ gps-events-rules:         3,000 точек/сек (~30%)                    │
+│  └─ gps-events-retranslation: 1,000 точек/сек (~10%)                    │
 │                                                                         │
-│  Итого: 1.3x трафик (вместо 3x при трёх топиках)                        │
-│  ✅ Приемлемо!                                                          │
+│  Итого: 1.4x трафик (приемлемый overhead за отсутствие DB lookup)        │
+│  ✅ Integration Service не ходит в PostgreSQL на каждое сообщение       │
 │                                                                         │
-│  При 200 байт/точка:                                                    │
-│  ├─ gps-events:       ~2 MB/sec → ~170 GB/day                           │
-│  └─ gps-events-rules: ~0.6 MB/sec → ~50 GB/day                          │
+│  При 200 байт/точка (+50 байт retranslationTargets):                    │
+│  ├─ gps-events:              ~2 MB/sec → ~170 GB/day                    │
+│  ├─ gps-events-rules:        ~0.6 MB/sec → ~50 GB/day                   │
+│  └─ gps-events-retranslation: ~0.25 MB/sec → ~20 GB/day                 │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1715,5 +1743,301 @@ object Main extends ZIOAppDefault:
 
 ---
 
-**Дата:** 26 января 2026  
-**Статус:** Документация готова ✅
+**Дата:** 12 февраля 2026  
+**Статус:** Документация обновлена ✅
+
+---
+
+## Типизированные ошибки парсинга (ADT)
+
+### Проблема (текущий код)
+
+Все парсеры (Teltonika, Wialon, Ruptela, NavTelecom) используют `throw new Exception(...)` / `throw new RuntimeException(...)` — это нарушает FP-принципы и не даёт структурированной информации об ошибке.
+
+### Решение: sealed trait ParseError
+
+```scala
+/**
+ * Иерархия ошибок парсинга GPS-пакетов
+ * 
+ * Каждая ошибка содержит:
+ * - protocol: какой парсер вызвал ошибку
+ * - message: человекочитаемое описание
+ * - field: какое именно поле не удалось распарсить (если применимо)
+ * - rawBytes: сырые данные для отладки (первые N байт)
+ */
+sealed trait ParseError extends Throwable:
+  def protocol: String
+  def message: String
+
+object ParseError:
+  /** Недостаточно байт для чтения пакета */
+  case class InsufficientData(
+    protocol: String,
+    expected: Int,
+    actual: Int,
+    stage: String  // "imei", "header", "data", "crc"
+  ) extends ParseError:
+    def message = s"[$protocol] $stage: ожидал $expected байт, получил $actual"
+
+  /** Невалидный формат поля */
+  case class InvalidField(
+    protocol: String,
+    fieldName: String,
+    rawValue: String,
+    reason: String
+  ) extends ParseError:
+    def message = s"[$protocol] Невалидное поле '$fieldName': $rawValue ($reason)"
+
+  /** Невалидный IMEI */
+  case class InvalidImei(
+    protocol: String,
+    imei: String,
+    reason: String
+  ) extends ParseError:
+    def message = s"[$protocol] Невалидный IMEI: $imei ($reason)"
+
+  /** Ошибка контрольной суммы */
+  case class CrcMismatch(
+    protocol: String,
+    expected: Long,
+    actual: Long
+  ) extends ParseError:
+    def message = s"[$protocol] CRC не совпадает: ожидал=$expected, получил=$actual"
+
+  /** Неподдерживаемая версия кодека */
+  case class UnsupportedCodec(
+    protocol: String,
+    codecId: Int
+  ) extends ParseError:
+    def message = s"[$protocol] Неподдерживаемый кодек: 0x${codecId.toHexString}"
+
+  /** Несовпадение количества записей */
+  case class RecordCountMismatch(
+    protocol: String,
+    headerCount: Int,
+    trailerCount: Int
+  ) extends ParseError:
+    def message = s"[$protocol] Записи: заголовок=$headerCount, footer=$trailerCount"
+
+  /** Невалидная сигнатура пакета */
+  case class InvalidSignature(
+    protocol: String,
+    expected: String,
+    actual: String
+  ) extends ParseError:
+    def message = s"[$protocol] Невалидная сигнатура: ожидал=$expected, получил=$actual"
+
+  /** Неизвестный тип пакета */
+  case class UnknownPacketType(
+    protocol: String,
+    packetType: String
+  ) extends ParseError:
+    def message = s"[$protocol] Неизвестный тип пакета: $packetType"
+```
+
+### Миграция парсеров
+
+**До (throw):**
+```scala
+// ❌ TeltonikaParser.scala
+throw new Exception(s"Невалидный preamble: $preamble")
+throw new Exception(s"CRC не совпадает: calculated=$calc, received=$recv")
+```
+
+**После (ADT):**
+```scala
+// ✅ TeltonikaParser.scala
+ZIO.fail(ParseError.InvalidSignature("teltonika", "00000000", preamble.toString))
+ZIO.fail(ParseError.CrcMismatch("teltonika", calc, recv))
+```
+
+### Что это даёт
+
+- **Метрики:** можно считать ошибки по типам (`InvalidImei` vs `CrcMismatch`)
+- **Мониторинг:** алерт "много CRC ошибок от протокола X" = проблема с сетью
+- **Отладка:** в логах видно конкретную причину, а не generic Exception
+- **FP:** ошибки в сигнатурах типов, компилятор помогает обрабатывать все случаи
+
+---
+
+## Post-MVP: GPS спуфинг-фильтр
+
+### Проблема
+
+В крупных городах России (особенно центр Москвы) системы РЭБ подавляют/подменяют GPS сигнал. Типичная аномалия: трекер едет по Тверской → внезапная точка в аэропорту Внуково (50 км). Это **не ошибка трекера** и **не телепортация** — это намеренное искажение координат служебными системами.
+
+Dead Reckoning фильтр отсекает такую точку (>300 км/ч), но **не восстанавливает реальный маршрут**.
+
+### Концепция: SpoofingFilter (расширяющаяся окружность)
+
+```
+             Время →
+     
+     ●───●───●───X · · · X · · · X───●───●───●
+     │ нормальные │  спуфинг-зона │ восстановление
+     │   точки    │  (Внуково)   │
+     │            │              │
+     │   [A]      │              │    [B]
+     │ last valid  │              │  first valid
+     
+     Алгоритм:
+     
+     1. Детектим аномалию: точка [X] далеко от [A] за слишком короткое время
+     2. Запоминаем контекст:
+        - последняя валидная точка [A] (из Redis)
+        - последняя известная скорость V (из Redis)
+        - время начала аномалии T0
+     3. Каждую следующую точку проверяем:
+        - ΔT = текущее_время - T0
+        - R = V × 1.5 × ΔT (окружность растёт со скоростью 1.5x)
+        - Если новая точка попадает в окружность с центром [A] и радиусом R → ВАЛИДНА [B]
+     4. При [B] — выходим из спуфинг-режима
+     5. Между [A] и [B] — можно аппроксимировать маршрут (интерполяция)
+```
+
+### Состояние фильтра (в Redis или Ref)
+
+```scala
+case class SpoofingContext(
+  lastValidPoint: GpsPoint,       // точка [A]
+  lastValidSpeed: Double,         // скорость в [A] (км/ч)
+  spoofingStartTime: Instant,     // когда началась аномалия
+  spoofedPoints: List[GpsPoint],  // накопленные аномальные точки
+  radiusGrowthFactor: Double = 1.5 // множитель роста окружности
+)
+```
+
+### Алгоритм проверки
+
+```scala
+def checkSpoofing(
+  newPoint: GpsPoint,
+  context: SpoofingContext
+): SpoofingResult =
+  val elapsed = Duration.between(context.spoofingStartTime, newPoint.deviceTime)
+  val elapsedHours = elapsed.toMillis / 3_600_000.0
+  
+  // Радиус окружности растёт из точки [A] со скоростью V × 1.5
+  val radiusKm = context.lastValidSpeed * context.radiusGrowthFactor * elapsedHours
+  
+  // Дистанция от [A] до новой точки
+  val distanceKm = GeoMath.distanceKm(
+    context.lastValidPoint.latitude, context.lastValidPoint.longitude,
+    newPoint.latitude, newPoint.longitude
+  )
+  
+  if distanceKm <= radiusKm then
+    SpoofingResult.RecoveredValid(newPoint)  // точка [B] — вернулись в нормальный режим
+  else
+    SpoofingResult.StillSpoofed(newPoint)    // всё ещё аномалия — копим контекст
+```
+
+### Готовые OSM-данные по дорогам
+
+Для более точного восстановления маршрута:
+
+- **OSRM** (Open Source Routing Machine) — map matching API (snap GPS точек к дорогам)
+- **Valhalla** — аналог OSRM (поддерживает map matching из коробки)
+- **pgRouting** — расширение PostGIS для маршрутизации в базе данных
+- **OpenStreetMap для России** — полный граф дорог, обновляется сообществом
+
+Для Post-MVP можно поднять OSRM контейнер с OSM-данными России и восстанавливать маршрут между [A] и [B] через map matching.
+
+### Интеграция в Pipeline
+
+```
+parseData → deadReckoningFilter → [spoofingFilter] → stationaryFilter → Kafka
+                                       ↑
+                                  Post-MVP
+```
+
+### Конфигурация (DynamicConfigService)
+
+```
+spoofing_filter_enabled: true
+spoofing_radius_growth_factor: 1.5    # множитель скорости роста окружности
+spoofing_max_duration_minutes: 60     # макс. время аномалии (после — сброс)
+spoofing_min_distance_km: 5.0         # мин. расстояние для детекции (< 5 км не спуфинг)
+```
+
+---
+
+## ⚠️ TODO: Доработки парсеров (MVP)
+
+1. **Заменить `throw new Exception` на ADT-ошибки** во всех парсерах:
+   - `TeltonikaParser.scala` — 8 мест с throw
+   - `WialonParser.scala` — 4 места с throw
+   - `RuptelaParser.scala` — 2 места с throw
+   - `NavTelecomParser.scala` — 5 мест с throw
+2. **Возвращать `IO[ParseError, T]`** вместо raw throw
+3. **Добавить метрики** по типам ошибок парсинга
+
+---
+
+## ✅ РЕШЕНО: Доставка команд (12 февраля 2026)
+
+### Kafka device-commands + Static Partition Assignment
+
+**Архитектура:** Каждый CM инстанс привязан к **своей партиции** Kafka топика `device-commands`.
+Маршрутизация: `protocol → instanceId → partition` (статичный маппинг).
+
+```
+teltonika  → cm-instance-1 → partition 0
+wialon     → cm-instance-2 → partition 1
+ruptela    → cm-instance-3 → partition 2
+navtelecom → cm-instance-4 → partition 3
+```
+
+**Device Manager** определяет protocol устройства из БД и публикует команду с key=instanceId.
+**Connection Manager** использует `kafkaConsumer.assign(partition)` (НЕ Consumer Group).
+
+**При получении команды из Kafka:**
+- Трекер онлайн → отправляем сразу по TCP (<100ms)
+- Трекер offline → in-memory queue + Redis ZSET backup (`pending_commands:{imei}`)
+
+**При подключении трекера:**
+- Объединяем in-memory queue + Redis backup
+- Дедупликация по `commandId`
+- Отправляем все pending команды
+- Очищаем in-memory + Redis
+
+### Redis disconnect: что очищаем и зачем
+
+При отключении трекера **очищаются только connection-поля** в Redis:
+- `connection_instance` → какой CM instance обслуживает трекер
+- `connection_time` → время подключения
+- `connection_ip` → IP адрес
+
+**НЕ очищаются:**
+- Позиция устройства (`lat`, `lon`, `speed`, `time`)
+- Контекст устройства (`vehicleId`, `orgId`, `hasGeozones`, `hasRetranslation`)
+
+Причина: при переподключении трекера (reconnect, сетевой сбой) контекст нужен сразу, а connection-поля обновятся при новом подключении.
+
+---
+
+## ⚠️ TODO: WebSocket / Real-time Service (MVP)
+
+### Архитектура передачи точек в реальном времени
+
+**Решение для MVP:** Polling вместо WebSocket push
+
+```
+Connection Manager
+    ↓ (Kafka: gps-events, ВСЕГДА)
+    ↓
+WebSocket/Real-time Service
+    ↓ (Kafka consumer, группирует по orgId)
+    ↓ хранит в памяти: Map[UserId, List[GpsPoint]]
+    ↓
+Frontend (polling каждые 3 сек)
+    → GET /api/v1/realtime/positions
+    ← JSON: {vehicles: [{id, lat, lon, speed, ...}]}
+```
+
+**Оптимизация:**
+- Флаг `isUserOnline` в Redis — если пользователь авторизован, его точки накапливаются
+- CM не знает про пользователей — просто шлёт ВСЁ в `gps-events`
+- Real-time Service подписан на `gps-events`, фильтрует по orgId авторизованных пользователей
+- 1000 пользователей × 10 машин × polling 3 сек = ~3300 RPS — нормально для zio-http

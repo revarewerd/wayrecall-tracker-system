@@ -4,6 +4,7 @@
 set -e
 
 SERVER="wogulis@192.168.1.5"
+SSH_PORT=2220
 REMOTE_PATH="/home/wogulis/projects/wayrecall-tracker-system"
 
 # Цвета
@@ -18,7 +19,7 @@ echo -e "${BLUE}  TrackerGPS Status${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
-ssh $SERVER << 'ENDSSH'
+ssh -p $SSH_PORT $SERVER << 'ENDSSH'
 set -e
 
 GREEN='\033[0;32m'

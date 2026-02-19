@@ -31,10 +31,10 @@
 
 | Параметр | Значение |
 |----------|----------|
-| **Вход** | Kafka (gps-events), REST API (inbound) |
+| **Вход** | Kafka (gps-events-retranslation, geozone-events, sensor-events, device-status), REST API (inbound) |
 | **Выход** | Wialon, webhooks, external APIs |
-| **БД** | PostgreSQL (конфигурации) |
-| **Кеш** | Redis (rate limiting, retry state) |
+| **БД** | PostgreSQL (конфигурации, retranslation targets) |
+| **Кеш** | Redis (rate limiting, retry state, **hasRetranslation flags → device:{imei}**) |
 
 ### Основные функции
 
@@ -43,6 +43,7 @@
 3. **API Inbound** — приём данных от внешних систем
 4. **Protocol Adapters** — конвертация форматов
 5. **Retry Queue** — повторные попытки при ошибках
+6. **Redis Sync** — запись `hasRetranslation` / `retranslationTargets` в Redis для Connection Manager
 
 ---
 
@@ -51,8 +52,8 @@
 ```mermaid
 flowchart TB
     subgraph Kafka["Apache Kafka"]
-        GPS[gps-events]
-        Events[geozone-events<br/>sensor-events]
+        GPS[gps-events-retranslation]
+        Events[geozone-events<br/>sensor-events<br/>device-status]
     end
 
     subgraph IS["Integration Service :8096"]
@@ -76,6 +77,7 @@ flowchart TB
         
         RetryQ[Retry Queue]
         REST[REST API :8096]
+        Sync[Redis Sync<br/>hasRetranslation flags]
     end
 
     subgraph External["Внешние системы"]
@@ -86,14 +88,14 @@ flowchart TB
     end
 
     subgraph Storage["Хранилища"]
-        PG[(PostgreSQL)]
-        Redis[(Redis)]
+        PG[(PostgreSQL<br/>retranslation configs)]
+        Redis[(Redis<br/>device:{imei})]
     end
 
     GPS --> Consumer
     Events --> Consumer
     Consumer --> Router
-    Router --> Filter
+    Router -->|retranslationTargets<br/>уже в сообщении| Filter
     Filter --> WA & WHA & GA
     WA --> WS --> Wialon
     WHA --> WHS --> WH1 & WH2
@@ -104,7 +106,9 @@ flowchart TB
     ExtAPI --> REST
     REST --> PG
     
-    Router <--> PG
+    PG -->|startup sync +<br/>CRUD events| Sync
+    Sync -->|HMSET hasRetranslation<br/>retranslationTargets| Redis
+    
     RetryQ <--> Redis
 ```
 
@@ -560,10 +564,10 @@ SELECT add_retention_policy('integration_logs', INTERVAL '7 days');
 object IntegrationEventConsumer {
   
   val topics = List(
-    "gps-events",       // Для Wialon retranslation
-    "geozone-events",   // Для webhooks
-    "sensor-events",    // Для webhooks
-    "device-status"     // Для webhooks
+    "gps-events-retranslation",  // GPS точки с hasRetranslation=true (retranslationTargets встроены)
+    "geozone-events",            // Для webhooks
+    "sensor-events",             // Для webhooks
+    "device-status"              // Для webhooks
   )
   
   def run(
@@ -597,26 +601,162 @@ class IntegrationRouter(
   
   def route(event: IntegrationEvent): Task[Unit] = {
     for {
-      // Получаем конфигурации для организации
-      configs <- configCache.getConfigs(event.organizationId)
-      
-      // Wialon (только для GPS)
+      // GPS ретрансляция — targets уже встроены в сообщение,
+      // НЕ нужен lookup в PostgreSQL на каждую точку!
       _ <- ZIO.when(event.isGpsEvent) {
-        ZIO.foreachParDiscard(configs.wialonIntegrations.filter(_.matches(event))) { wialon =>
-          wialonService.send(event.asGpsPoint, wialon)
+        val targets = event.asGpsPoint.retranslationTargets.getOrElse(Nil)
+        ZIO.foreachParDiscard(targets) { targetId =>
+          targetId match
+            case s if s.startsWith("wialon-") =>
+              for
+                config <- configCache.getWialonConfig(s.stripPrefix("wialon-").toLong)
+                _      <- wialonService.send(event.asGpsPoint, config)
+              yield ()
+            case s if s.startsWith("webhook-") =>
+              for
+                config <- configCache.getWebhookConfig(s.stripPrefix("webhook-").toLong)
+                _      <- webhookService.send(event.toWebhookPayload, config)
+              yield ()
+            case unknown =>
+              ZIO.logWarning(s"Unknown retranslation target: $unknown")
         }
       }
       
-      // Webhooks (для всех событий)
-      matchingWebhooks = configs.webhooks.filter(_.matches(event))
-      _ <- ZIO.foreachParDiscard(matchingWebhooks) { webhook =>
-        webhookService.send(event.toWebhookPayload, webhook)
+      // Webhooks для не-GPS событий (geozone-events, sensor-events, device-status)
+      _ <- ZIO.when(!event.isGpsEvent) {
+        for
+          configs <- configCache.getConfigs(event.organizationId)
+          matchingWebhooks = configs.webhooks.filter(_.matchesEventType(event.eventType))
+          _ <- ZIO.foreachParDiscard(matchingWebhooks) { webhook =>
+            webhookService.send(event.toWebhookPayload, webhook)
+          }
+        yield ()
       }
-      
     } yield ()
   }
 }
 ```
+
+---
+
+## Redis синхронизация (hasRetranslation flags)
+
+> **Integration Service является ВЛАДЕЛЬЦЕМ полей** `hasRetranslation` и `retranslationTargets` в Redis хеше `device:{imei}`.
+> Connection Manager ЧИТАЕТ эти поля при обогащении GPS точек.
+
+### Принцип работы
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Integration Service → Redis device:{imei}                              │
+│                                                                         │
+│  ПОЛЯ (записывает Integration Service, читает Connection Manager):      │
+│  ├─ hasRetranslation      = "true" | "false"                            │
+│  └─ retranslationTargets  = "wialon-42,webhook-7"   (CSV строка)        │
+│                                                                         │
+│  ИСТОЧНИК ПРАВДЫ: PostgreSQL (wialon_integrations, webhook_configs)     │
+│  КЕШИРОВАНИЕ: Redis (для hot-path в Connection Manager)                 │
+│  СИНХРОНИЗАЦИЯ: startup full sync + event-driven incremental            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Startup Sync (при запуске сервиса)
+
+```scala
+/**
+ * Полная синхронизация Redis ← PostgreSQL при старте Integration Service.
+ * Гарантирует, что все флаги актуальны после перезапуска / редеплоя.
+ */
+def startupSync: Task[Unit] = for
+  // 1. Загружаем все активные конфигурации ретрансляции из PostgreSQL
+  wialonConfigs  <- wialonRepo.findAllEnabled
+  webhookConfigs <- webhookRepo.findAllEnabled
+  
+  // 2. Собираем множество IMEI → List[targetId]
+  //    Каждый IMEI может иметь несколько целей ретрансляции
+  deviceTargets = buildDeviceTargetMap(wialonConfigs, webhookConfigs)
+  
+  // 3. Для каждого IMEI обновляем два поля в Redis
+  _ <- ZIO.foreachParDiscard(deviceTargets.toList) { case (imei, targets) =>
+    redis.hmset(s"device:$imei", Map(
+      "hasRetranslation"    -> "true",
+      "retranslationTargets" -> targets.mkString(",")
+    ))
+  }
+  
+  // 4. Очищаем флаги у устройств, которых НЕТ ни в одной конфигурации
+  allDeviceImeis   <- deviceRepo.findAllImeis
+  retranslatedImeis = deviceTargets.keySet
+  orphanedImeis     = allDeviceImeis.toSet -- retranslatedImeis
+  _ <- ZIO.foreachParDiscard(orphanedImeis) { imei =>
+    redis.hmset(s"device:$imei", Map(
+      "hasRetranslation"    -> "false",
+      "retranslationTargets" -> ""
+    ))
+  }
+  
+  _ <- ZIO.logInfo(s"Startup sync: ${deviceTargets.size} devices with retranslation, ${orphanedImeis.size} cleaned")
+yield ()
+
+/**
+ * Собирает карту IMEI → список target ID из всех конфигураций.
+ * Target ID формат: "wialon-{id}" или "webhook-{id}"
+ */
+def buildDeviceTargetMap(
+  wialonConfigs: List[WialonIntegration],
+  webhookConfigs: List[WebhookConfig]
+): Map[String, List[String]] =
+  val wialonTargets: List[(String, String)] = for
+    config <- wialonConfigs.filter(_.enabled)
+    imei   <- config.imeiMapping.keys.toList
+  yield (imei, s"wialon-${config.id}")
+  
+  val webhookTargets: List[(String, String)] = for
+    config    <- webhookConfigs.filter(_.enabled)
+    vehicleId <- config.vehicleIds
+    imei      <- vehicleToImeiLookup(vehicleId).toList
+  yield (imei, s"webhook-${config.id}")
+  
+  (wialonTargets ++ webhookTargets)
+    .groupMap(_._1)(_._2)
+```
+
+### Event-driven обновления (при CRUD через REST API)
+
+```scala
+/**
+ * При создании/обновлении/удалении конфигурации ретрансляции
+ * немедленно обновляем Redis флаги для затронутых устройств.
+ */
+def onRetranslationConfigChanged(imeis: Set[String]): Task[Unit] = for
+  // Пересчитываем targets для затронутых IMEI
+  _ <- ZIO.foreachParDiscard(imeis) { imei =>
+    for
+      targets <- findTargetsForImei(imei)
+      _       <- if targets.nonEmpty then
+                   redis.hmset(s"device:$imei", Map(
+                     "hasRetranslation"    -> "true",
+                     "retranslationTargets" -> targets.mkString(",")
+                   ))
+                 else
+                   redis.hmset(s"device:$imei", Map(
+                     "hasRetranslation"    -> "false",
+                     "retranslationTargets" -> ""
+                   ))
+    yield ()
+  }
+  _ <- ZIO.logInfo(s"Updated retranslation flags for ${imeis.size} devices")
+yield ()
+```
+
+### Consistency гарантии
+
+| Механизм | Описание |
+|----------|----------|
+| **Startup sync** | При запуске — полная синхронизация PostgreSQL → Redis |
+| **Event-driven** | При CRUD — мгновенное обновление затронутых IMEI |
+| **Eventual consistency** | Redis отстаёт от PostgreSQL максимум на время рестарта |
+| **Отказоустойчивость** | Если Redis недоступен → сервис стартует, но логирует ошибку; повторяет sync через Schedule |
 
 ---
 

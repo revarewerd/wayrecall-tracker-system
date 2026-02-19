@@ -1,12 +1,10 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
     container_name: tracker-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - /mnt/raid/docker-data/redis:/data
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -52,11 +50,14 @@ services:
     restart: unless-stopped
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${SERVER_HOST:-192.168.1.5}:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${SERVER_HOST:-192.168.1.5}:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -88,17 +89,22 @@ services:
     container_name: tracker-timescaledb
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-tracker}
       POSTGRES_USER: ${POSTGRES_USER:-tracker}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tracker123}
-      POSTGRES_INITDB_ARGS: "-c max_connections=100 -c shared_buffers=256MB -c effective_cache_size=1GB -c work_mem=4MB"
       PGDATA: /var/lib/postgresql/data/pgdata
       TZ: ${TZ:-Europe/Moscow}
+    command: >
+      postgres
+      -c max_connections=100
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c work_mem=4MB
     volumes:
       - /mnt/raid/docker-data/postgres:/var/lib/postgresql/data
-      - ../infra/databases/timescaledb-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ../infra/postgresql/init-docker.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tracker}"]
       interval: 10s
@@ -185,6 +191,313 @@ services:
       resources:
         limits:
           memory: 100M
+    networks:
+      - tracker-network
+
+  # ============================================================
+  # Connection Manager — 4 инстанса (по протоколу)
+  # ============================================================
+  
+  connection-manager-teltonika:
+    image: wayrecall/connection-manager:latest
+    build:
+      context: ../services/connection-manager
+      dockerfile: Dockerfile
+    container_name: tracker-cm-teltonika
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "5001:5001"
+      - "8081:8080"
+    environment:
+      INSTANCE_ID: "cm-instance-1"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      TCP_ENABLED_PROTOCOLS: "teltonika"
+      LOG_LEVEL: "INFO"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    networks:
+      - tracker-network
+
+  connection-manager-wialon:
+    image: wayrecall/connection-manager:latest
+    build:
+      context: ../services/connection-manager
+      dockerfile: Dockerfile
+    container_name: tracker-cm-wialon
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "5002:5002"
+      - "8082:8080"
+    environment:
+      INSTANCE_ID: "cm-instance-2"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      TCP_ENABLED_PROTOCOLS: "wialon"
+      LOG_LEVEL: "INFO"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    networks:
+      - tracker-network
+
+  connection-manager-ruptela:
+    image: wayrecall/connection-manager:latest
+    build:
+      context: ../services/connection-manager
+      dockerfile: Dockerfile
+    container_name: tracker-cm-ruptela
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "5003:5003"
+      - "8083:8080"
+    environment:
+      INSTANCE_ID: "cm-instance-3"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      TCP_ENABLED_PROTOCOLS: "ruptela"
+      LOG_LEVEL: "INFO"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    networks:
+      - tracker-network
+
+  connection-manager-navtelecom:
+    image: wayrecall/connection-manager:latest
+    build:
+      context: ../services/connection-manager
+      dockerfile: Dockerfile
+    container_name: tracker-cm-navtelecom
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "5004:5004"
+      - "8084:8080"
+    environment:
+      INSTANCE_ID: "cm-instance-4"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      TCP_ENABLED_PROTOCOLS: "navtelecom"
+      LOG_LEVEL: "INFO"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    networks:
+      - tracker-network
+
+  # ============================================================
+  # Device Manager — REST API
+  # ============================================================
+  
+  device-manager:
+    image: wayrecall/device-manager:latest
+    build:
+      context: ../services/device-manager
+      dockerfile: Dockerfile
+    container_name: tracker-device-manager
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8092:8082"
+    environment:
+      APP_HTTP_PORT: "8082"
+      APP_DATABASE_HOST: "timescaledb"
+      APP_DATABASE_PORT: "5432"
+      APP_DATABASE_NAME: "${POSTGRES_DB:-tracker}"
+      APP_DATABASE_USERNAME: "${POSTGRES_USER:-tracker}"
+      APP_DATABASE_PASSWORD: "${POSTGRES_PASSWORD:-tracker123}"
+      APP_KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      APP_REDIS_HOST: "redis"
+      APP_REDIS_PORT: "6379"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - tracker-network
+
+  # ============================================================
+  # History Writer — запись GPS событий в TimescaleDB
+  # ============================================================
+  
+  history-writer:
+    image: wayrecall/history-writer:latest
+    build:
+      context: ../services/history-writer
+      dockerfile: Dockerfile
+    container_name: tracker-history-writer
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8093:8083"
+    environment:
+      APP_HTTP_PORT: "8083"
+      APP_DATABASE_HOST: "timescaledb"
+      APP_DATABASE_PORT: "5432"
+      APP_DATABASE_NAME: "${POSTGRES_DB:-tracker}"
+      APP_DATABASE_USERNAME: "${POSTGRES_USER:-tracker}"
+      APP_DATABASE_PASSWORD: "${POSTGRES_PASSWORD:-tracker123}"
+      APP_KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      APP_BATCH_MAX_SIZE: "500"
+      APP_BATCH_FLUSH_INTERVAL_MS: "5000"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - tracker-network
+
+  # ============================================================
+  # Web Frontend — пользовательская панель
+  # ============================================================
+
+  web-frontend:
+    image: wayrecall/web-frontend:latest
+    build:
+      context: ../services/web-frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: "http://${SERVER_HOST:-192.168.1.5}:8092"
+        VITE_WS_URL: "ws://${SERVER_HOST:-192.168.1.5}:8094"
+    container_name: tracker-web-frontend
+    restart: unless-stopped
+    depends_on:
+      device-manager:
+        condition: service_healthy
+    ports:
+      - "3001:80"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    networks:
+      - tracker-network
+
+  # ============================================================
+  # Web Billing — админка
+  # ============================================================
+
+  web-billing:
+    image: wayrecall/web-billing:latest
+    build:
+      context: ../services/web-billing
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: "http://${SERVER_HOST:-192.168.1.5}:8092"
+    container_name: tracker-web-billing
+    restart: unless-stopped
+    depends_on:
+      device-manager:
+        condition: service_healthy
+    ports:
+      - "3002:80"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    networks:
+      - tracker-network
+
+  # ============================================================
+  # Nginx Reverse Proxy — главный вход на порту 80
+  # Маршрутизация: / → web-frontend, /admin → web-billing
+  # ============================================================
+
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: tracker-nginx-proxy
+    restart: unless-stopped
+    depends_on:
+      - web-frontend
+      - web-billing
+    ports:
+      - "80:80"
+    volumes:
+      - ../infra/nginx/proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
     networks:
       - tracker-network
 

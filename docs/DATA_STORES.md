@@ -1,7 +1,7 @@
 # 💾 Data Stores: Схемы хранилищ
 
 > **Документ описывает:** TimescaleDB, PostgreSQL, Redis, Kafka  
-> **Версия:** 3.0
+> **Версия:** 4.0 (добавлены таблицы из аудита legacy: drivers, vehicle_groups, sensor_profiles, audit_log)
 
 ---
 
@@ -76,8 +76,14 @@
 │  │   • devices — Устройства (CRUD)                                     │   │
 │  │   • organizations — Организации                                     │   │
 │  │   • users — Пользователи                                            │   │
+│  │   • drivers — Водители                                              │   │
+│  │   • vehicle_groups — Группы ТС                                      │   │
+│  │   • vehicle_group_members — Состав групп (M2M)                      │   │
+│  │   • sensor_profiles — Профили/калибровка датчиков                    │   │
 │  │   • notification_rules — Правила уведомлений                        │   │
 │  │   • command_log — Журнал команд                                     │   │
+│  │   • audit_log — Аудит-лог действий                                  │   │
+│  │   • retranslation_targets — Цели ретрансляции                       │   │
 │  │                                                                       │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
@@ -85,10 +91,9 @@
 │  │                             Redis 7                                   │   │
 │  │                                                                       │   │
 │  │   • device:{imei} — HASH (context + position + connection)          │   │
-│  │   • pending_commands:{imei} — Очередь команд (ZSET)                 │   │
-│  │   • command_status:{requestId} — Статус команды (HASH)              │   │
+│  │   • pending_commands:{imei} — Backup очередь команд (ZSET, owner: CM) │   │
 │  │   • unknown:{imei}:attempts — Rate limiting (STRING + TTL)          │   │
-│  │   • Pub/Sub каналы для команд                                        │   │
+│  │   • ⚠️ Pub/Sub и connection_registry убраны — команды через Kafka    │   │
 │  │                                                                       │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
@@ -99,6 +104,7 @@
 │  │   • gps-events-rules (6 partitions, 7 days) — Точки с геозонами     │   │
 │  │   • gps-events-unverified (6 partitions, 7 days) — DLQ              │   │
 │  │   • device-status (6 partitions, 7 days) — Online/offline           │   │
+│  │   • device-commands (6 partitions, 7 days) — Команды на трекеры     │   │
 │  │   • geozone-events (6 partitions, 30 days) — Enter/leave            │   │
 │  │   • command-audit (3 partitions, 90 days) — Аудит команд            │   │
 │  │                                                                       │   │
@@ -489,8 +495,18 @@ CREATE TABLE devices (
     plate_number VARCHAR(20),
     vin VARCHAR(20),
     
+    -- SIM карта
+    phone VARCHAR(20),                        -- номер SIM
+    sim_provider VARCHAR(50),                 -- оператор связи (МТС, Билайн, etc)
+    sim_iccid VARCHAR(25),                    -- ICCID SIM карты
+    
+    -- Оборудование (из legacy Stels Equipment)
+    device_brand VARCHAR(50),                 -- марка трекера (Teltonika, Ruptela, etc)
+    device_model VARCHAR(50),                 -- модель (FMB920, FM-Pro4, etc)
+    device_login VARCHAR(50),                 -- логин устройства (для Wialon/NavTelecom)
+    device_password VARCHAR(50),              -- пароль устройства
+    
     -- Контакт
-    phone VARCHAR(20),                        -- SIM карта в трекере
     driver_id INTEGER REFERENCES drivers(id),
     
     -- Отображение на карте
@@ -733,6 +749,171 @@ CREATE INDEX idx_command_log_status
     WHERE status IN ('pending', 'sent');
 ```
 
+### 🆕 drivers (Водители) — добавлено после аудита legacy
+
+**Назначение:** Водители, привязанные к устройствам/ТС
+
+> Источник: в legacy Stels водитель не был отдельной сущностью, но ссылка `driver_id` 
+> уже присутствует в нашей таблице `devices`. Нужна отдельная таблица.
+
+```sql
+CREATE TABLE drivers (
+    id SERIAL PRIMARY KEY,
+    organization_id INTEGER NOT NULL REFERENCES organizations(id),
+    
+    -- Персональные данные
+    name VARCHAR(100) NOT NULL,
+    phone VARCHAR(20),
+    license_number VARCHAR(30),             -- номер водительского удостоверения
+    license_expiry DATE,                     -- срок действия ВУ
+    
+    -- Идентификация
+    rfid_key VARCHAR(50),                    -- RFID ключ для iButton/Dallas
+    
+    -- Статус
+    is_active BOOLEAN DEFAULT true,
+    
+    -- Timestamps
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_drivers_org 
+    ON drivers (organization_id) 
+    WHERE is_active = true;
+```
+
+### 🆕 vehicle_groups (Группы ТС) — добавлено после аудита legacy
+
+**Назначение:** Именованные группы транспортных средств для группового просмотра
+
+> Источник: коллекция `groupsOfObjects` в legacy Stels.
+> Пользователь создаёт группы ("Грузовики", "Маршрут 5") для фильтрации на карте и в отчётах.
+
+```sql
+CREATE TABLE vehicle_groups (
+    id SERIAL PRIMARY KEY,
+    organization_id INTEGER NOT NULL REFERENCES organizations(id),
+    
+    name VARCHAR(100) NOT NULL,
+    description TEXT,
+    color VARCHAR(7),                        -- цвет группы на карте (#RRGGBB)
+    
+    -- Владелец группы
+    created_by INTEGER REFERENCES users(id),
+    
+    -- Видимость
+    is_shared BOOLEAN DEFAULT false,         -- доступна всем пользователям org
+    
+    -- Timestamps
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_vehicle_groups_org 
+    ON vehicle_groups (organization_id);
+
+CREATE INDEX idx_vehicle_groups_user 
+    ON vehicle_groups (created_by);
+```
+
+### 🆕 vehicle_group_members (Состав групп) — M2M связь
+
+```sql
+CREATE TABLE vehicle_group_members (
+    group_id INTEGER NOT NULL REFERENCES vehicle_groups(id) ON DELETE CASCADE,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    
+    added_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    PRIMARY KEY (group_id, device_id)
+);
+
+CREATE INDEX idx_vgm_device 
+    ON vehicle_group_members (device_id);
+```
+
+### 🆕 sensor_profiles (Профили датчиков) — добавлено после аудита legacy
+
+**Назначение:** Маппинг сырых параметров трекера на понятные имена датчиков
+
+> Источник: коллекция `sensorNames` + поле `objects.sensors` в legacy Stels.
+> В legacy: `sensorNames` хранит авто-определённые параметры по IMEI,
+> а `objects.sensors` хранит пользовательские настройки (имя, тип, калибровка).
+
+```sql
+CREATE TABLE sensor_profiles (
+    id SERIAL PRIMARY KEY,
+    device_id INTEGER NOT NULL REFERENCES devices(id),
+    
+    -- Идентификация датчика
+    param_code VARCHAR(50) NOT NULL,         -- код из трекера: "fuel_lvl", "adc1", "can_rpm"
+    
+    -- Пользовательские настройки
+    display_name VARCHAR(100),               -- Пользовательское имя: "Уровень топлива бак 1"
+    sensor_type VARCHAR(30),                 -- Тип: "fuel", "temperature", "voltage", "digital", "counter"
+    unit VARCHAR(20),                        -- Единица: "L", "°C", "V", "km/h"
+    
+    -- Калибровка (линейная или таблица)
+    calibration_type VARCHAR(20) DEFAULT 'none',  -- none, linear, table
+    calibration_params JSONB,                -- {"k": 0.01, "b": -50} или {"table": [[0, 0], [100, 50], [200, 100]]}
+    
+    -- Отображение
+    is_visible BOOLEAN DEFAULT true,         -- показывать ли на карте/в отчётах
+    sort_order INTEGER DEFAULT 0,
+    
+    -- Timestamps
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    UNIQUE(device_id, param_code)
+);
+
+CREATE INDEX idx_sensor_profiles_device 
+    ON sensor_profiles (device_id);
+```
+
+### 🆕 audit_log (Аудит-лог) — добавлено после аудита legacy
+
+**Назначение:** Централизованный лог аудита всех действий
+
+> Источник: коллекции `authlog` + `domainEvents` в legacy Stels.
+> В новом проекте — единый audit trail вместо Axon event sourcing.
+
+```sql
+CREATE TABLE audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    organization_id INTEGER REFERENCES organizations(id),
+    
+    -- Кто
+    user_id INTEGER REFERENCES users(id),
+    user_email VARCHAR(255),
+    ip_address INET,
+    
+    -- Что
+    action VARCHAR(50) NOT NULL,             -- login, logout, device.create, device.update, 
+                                             -- device.delete, command.send, user.create, etc
+    entity_type VARCHAR(30),                 -- device, user, organization, geozone, etc
+    entity_id VARCHAR(50),                   -- ID сущности
+    
+    -- Детали
+    details JSONB,                           -- {"old": {...}, "new": {...}} или {"reason": "..."}
+    
+    -- Время
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Партиционирование по месяцам (не hypertable, обычный partition)
+CREATE INDEX idx_audit_log_org_time 
+    ON audit_log (organization_id, created_at DESC);
+
+CREATE INDEX idx_audit_log_action 
+    ON audit_log (action, created_at DESC);
+
+CREATE INDEX idx_audit_log_entity 
+    ON audit_log (entity_type, entity_id, created_at DESC);
+```
+
 ---
 
 ## 🔴 Redis 7
@@ -795,38 +976,102 @@ HGETALL device:860123456789012
 # Device Manager удаляет при DELETE устройства
 ```
 
-#### pending_commands:{imei} — Очередь команд (ZSET)
+#### pending_commands:{imei} — Backup очереди команд (ZSET)
+
+**Назначение:** Персистентный backup для in-memory очереди (страховка на случай рестарта CM)
 
 ```redis
 # Структура (score = timestamp, для порядка)
 ZADD pending_commands:860123456789012 1706270400 \
-    '{"id":123,"type":"reboot","payload":{}}'
+    '{"commandId":123,"type":"reboot","payload":{}}'
 
 EXPIRE pending_commands:860123456789012 86400  # 24 часа
 
-# Получить все команды для устройства
-ZRANGE pending-cmd:860123456789012 0 -1
+# При подключении трекера: читаем backup
+ZRANGE pending_commands:860123456789012 0 -1
 
-# Удалить выполненную команду
-ZREM pending-cmd:860123456789012 '{"id":123,...}'
+# После отправки: очищаем
+DEL pending_commands:860123456789012
 
 # Размер: ~200 bytes per command
 # 1,000 pending commands = ~200 KB
 ```
 
-#### Pub/Sub каналы
+#### Доставка команд: Kafka (Static Partitioning) + In-Memory + Redis Backup
 
-```redis
-# Команды к устройству
-PUBLISH cmd:860123456789012 '{"type":"reboot","id":123}'
+> **Решение (12 февраля 2026):** Команды доставляются через **Kafka топик `device-commands`** со статичным партиционированием по instanceId (CM). In-memory очередь + Redis backup для оффлайн-трекеров.
 
-# Ответы от устройства
-PUBLISH cmd-response:860123456789012 '{"id":123,"status":"ok","response":"..."}'
+**Архитектура:**
 
-# WebSocket broadcast
-PUBLISH ws:org:456 '{"type":"position","device_id":123,"data":{...}}'
-PUBLISH ws:device:123 '{"type":"position","data":{...}}'
-PUBLISH ws:alerts:456 '{"type":"alert","device_id":123,"data":{...}}'
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Device Manager (REST API)                  │
+│                                                              │
+│  1. Получает команду от пользователя                        │
+│  2. Определяет protocol устройства (teltonika/wialon/...)   │
+│  3. Маппит protocol → instanceId (stateless!)               │
+│     teltonika → cm-instance-1                               │
+│     wialon    → cm-instance-2                               │
+│     ruptela   → cm-instance-3                               │
+│  4. Публикует в Kafka с key = instanceId                    │
+└─────────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────┐
+│           Kafka Topic: device-commands (6 partitions)        │
+│                                                              │
+│  Partition 0 ← cm-instance-1 (Teltonika)                    │
+│  Partition 1 ← cm-instance-2 (Wialon)                       │
+│  Partition 2 ← cm-instance-3 (Ruptela)                      │
+│  ...                                                         │
+│  Static Assignment (НЕ Consumer Group!)                     │
+└─────────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────┐
+│       Connection Manager (Static Partition Assignment)       │
+│                                                              │
+│  kafkaConsumer.assign(myPartition)  ← Статичная привязка!   │
+│                                                              │
+│  При получении команды из Kafka:                            │
+│    ┌─────────────────────────────────────────┐             │
+│    │ Проверяем: трекер подключён к ЭТОМУ CM? │             │
+│    └─────────────────────────────────────────┘             │
+│                    ↓                ↓                        │
+│              ✅ Онлайн        ⏳ Offline                     │
+│    Отправляем сразу TCP    In-Memory Queue                  │
+│           (<100ms)               +                           │
+│                            Redis ZSET Backup                 │
+│                                                              │
+│  При подключении трекера:                                   │
+│    1. Читаем In-Memory Queue                                │
+│    2. Читаем Redis ZSET (если CM рестартовал)              │
+│    3. Объединяем + дедупликация по commandId               │
+│    4. Отправляем все pending команды                        │
+│    5. Очищаем In-Memory + Redis                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Преимущества подхода:**
+- ✅ **Быстрая доставка:** Kafka push <100ms (не polling!)
+- ✅ **Персистентность:** Kafka retention 7 дней + Redis backup
+- ✅ **Не теряются:** при рестарте CM команды в Kafka + Redis
+- ✅ **Простое масштабирование:** добавляем CM с новым портом → новая партиция
+- ✅ **Порядок гарантирован:** FIFO в Kafka partition
+- ✅ **Нет Rebalance:** Static Assignment (НЕ Consumer Group)
+- ✅ **Низкая нагрузка на Redis:** только backup для offline трекеров
+- ✅ **At-least-once:** Kafka + Redis дублирование
+
+**Mapping Protocol → Instance ID (статичный):**
+```
+teltonika → cm-instance-1 (port 5001) → partition 0
+wialon    → cm-instance-2 (port 5002) → partition 1
+ruptela   → cm-instance-3 (port 5003) → partition 2
+navtelecom → cm-instance-4 (port 5004) → partition 3
+```
+
+**Расчёт Kafka:**
+```
+50 команд/сек × 300 bytes = ~15 KB/sec
+Retention 7 дней = ~9 GB (negligible)
 ```
 
 ### Мониторинг Redis
@@ -855,6 +1100,7 @@ PUBSUB NUMSUB cmd:860123456789012
 | gps-events-rules | 3,000 | ~200B | ~0.6 MB/s | 7 дней | ~350 GB |
 | gps-events-unverified | 100 | ~350B | ~35 KB/s | 7 дней | ~20 GB |
 | device-status | 100 | ~150B | ~15 KB/s | 7 дней | ~10 GB |
+| device-commands | 50 | ~300B | ~15 KB/s | 7 дней | ~9 GB |
 | geozone-events | 500 | ~200B | ~100 KB/s | 30 дней | ~250 GB |
 | command-audit | 50 | ~300B | ~15 KB/s | 90 дней | ~100 GB |
 
@@ -1050,6 +1296,161 @@ kafka-topics --create \
 }
 ```
 
+#### device-commands (команды на устройства)
+
+**Назначение:** Доставка команд от Device Manager → Connection Manager → GPS трекер
+
+**Producer:** Device Manager (REST API endpoint `/api/v1/commands`)  
+**Consumer:** Connection Manager (consumer group `connection-managers`)
+
+```bash
+kafka-topics --create \
+  --topic device-commands \
+  --partitions 6 \
+  --replication-factor 1 \
+  --config retention.ms=604800000 \
+  --config cleanup.policy=delete
+```
+
+**Schema (JSON):**
+```json
+{
+  "commandId": 12345,
+  "deviceId": 123,
+  "imei": "860123456789012",
+  "commandType": "reboot",
+  "payload": {},
+  "createdAt": 1706270400000,
+  "createdBy": 1,
+  "timeoutSeconds": 30
+}
+```
+
+**Partitioning:** `protocol → instanceId → partition` — **критично!** Гарантирует:
+- Команды попадают ТОЛЬКО на нужный CM (статичный mapping)
+- **Порядок команд** сохраняется (FIFO в Kafka partition)
+- Нет race condition между инстансами CM
+- При падении CM команды накапливаются в Kafka, обработаются после рестарта
+
+**Device Manager — отправка команды:**
+```scala
+def sendCommand(deviceId: Long, cmd: Command): Task[Unit] = for {
+  // Получаем protocol устройства (из cache или DB)
+  protocol <- getDeviceProtocol(deviceId)
+  
+  // Статичный mapping (config или match)
+  instanceId = protocol match {
+    case "teltonika" => "cm-instance-1"
+    case "wialon"    => "cm-instance-2"
+    case "ruptela"   => "cm-instance-3"
+    case "navtelecom" => "cm-instance-4"
+  }
+  
+  // Публикуем с key = instanceId (routing на нужную партицию)
+  _ <- kafkaProducer.send(
+    topic = "device-commands",
+    key = instanceId,  // ← Партиция определяется по instanceId
+    value = cmd.toJson
+  )
+  
+  // Сохраняем в command_log (PostgreSQL)
+  _ <- commandLogRepo.create(cmd.copy(status = "sent"))
+} yield ()
+```
+
+**Connection Manager — обработка команды:**
+```scala
+// In-memory pending queue (быстро, не нагружает Redis)
+val pendingCommands = new ConcurrentHashMap[String, Queue[Command]]()
+
+// Static Partition Assignment (НЕ Consumer Group!)
+val myPartition = Config.instanceId match {
+  case "cm-instance-1" => 0  // Teltonika
+  case "cm-instance-2" => 1  // Wialon
+  case "cm-instance-3" => 2  // Ruptela
+  case "cm-instance-4" => 3  // NavTelecom
+}
+
+kafkaConsumer.assign(
+  topic = "device-commands",
+  partitions = List(myPartition)
+)
+
+// Обработка команды из Kafka
+kafkaConsumer.subscribe { msg =>
+  val cmd = decode[Command](msg.value)
+  
+  connectionRegistry.get(cmd.imei) match {
+    case Some(connection) =>
+      // ✅ Трекер онлайн → отправляем сразу по TCP
+      connection.sendCommand(cmd).flatMap { response =>
+        // Публикуем результат в command-audit
+        publishCommandResult(cmd.commandId, "executed", response)
+      }
+    
+    case None =>
+      // ⏳ Трекер offline → складываем в очередь
+      // 1. In-Memory (быстро)
+      pendingCommands
+        .computeIfAbsent(cmd.imei, _ => new ConcurrentLinkedQueue())
+        .add(cmd)
+      
+      // 2. Redis Backup (персистентность на случай рестарта)
+      redis.zadd(
+        s"pending_commands:${cmd.imei}",
+        cmd.createdAt,
+        cmd.toJson
+      ).flatMap(_ =>
+        redis.expire(s"pending_commands:${cmd.imei}", 86400) // 24 часа
+      )
+  }
+}
+
+// При подключении трекера — отправляем pending команды
+def onDeviceConnected(imei: String, conn: Connection): Task[Unit] = for {
+  // 1. Читаем In-Memory
+  memoryQueue = Option(pendingCommands.remove(imei))
+    .map(_.asScala.toList)
+    .getOrElse(List.empty)
+  
+  // 2. Читаем Redis (на случай рестарта CM)
+  redisCommands <- redis.zrange(s"pending_commands:$imei", 0, -1)
+    .map(_.map(decode[Command]))
+  
+  // 3. Объединяем + дедупликация по commandId
+  allCommands = (memoryQueue ++ redisCommands)
+    .distinctBy(_.commandId)
+    .sortBy(_.createdAt)
+  
+  // 4. Отправляем все команды
+  _ <- ZIO.foreach(allCommands) { cmd =>
+    conn.sendCommand(cmd).tapBoth(
+      err => ZIO.logError(s"Failed to send command ${cmd.commandId}: $err"),
+      res => publishCommandResult(cmd.commandId, "executed", res)
+    )
+  }
+  
+  // 5. Очищаем Redis backup
+  _ <- redis.del(s"pending_commands:$imei")
+} yield ()
+```
+
+**Гарантии:**
+- ✅ **At-least-once:** Kafka retention 7 дней + Redis backup
+- ✅ **Порядок:** FIFO в Kafka partition + сортировка по timestamp
+- ✅ **Не теряются:** при рестарте CM команды в Kafka + Redis
+- ✅ **Дедупликация:** по commandId при подключении трекера
+- ✅ **Масштабирование:** добавляем CM → добавляем партицию
+- ✅ **Нет Rebalance:** Static Assignment (команды не переназначаются)
+
+**Сравнение подходов:**
+
+| Подход | Задержка | Гарантия | Порядок | Масштабируемость | Персистентность |
+|--------|----------|----------|---------|------------------|------------------|
+| Redis Pub/Sub | <10ms | ❌ Fire-and-forget | ❌ Нет | ❌ Нужна routing | ❌ Нет |
+| Polling Redis | 1-3 сек | ✅ Да | ✅ Да | ✅ Простая | ✅ Да |
+| **Kafka + Static** | **<100ms** | **✅ Да** | **✅ Да** | **✅ Простая** | **✅ Да** |
+
 #### geozone-events
 
 **Назначение:** События входа/выхода из геозон
@@ -1133,6 +1534,43 @@ kafka-topics --create \
   }
 }
 ```
+
+#### gps-events-retranslation (ретрансляция)
+
+**Назначение:** GPS точки для ретрансляции на внешние серверы (Wialon IPS, EGTS, HTTP)  
+**Producer:** Connection Manager (обогащённая точка, если устройство привязано к ретрансляции)  
+**Consumer:** Retranslation Service (Block 2, или External Integration Service)
+
+```bash
+kafka-topics --create \
+  --topic gps-events-retranslation \
+  --partitions 6 \
+  --replication-factor 1 \
+  --config retention.ms=604800000 \
+  --config cleanup.policy=delete \
+  --config compression.type=lz4
+```
+
+**Schema (JSON):**
+```json
+{
+  "vehicleId": 123,
+  "organizationId": 456,
+  "imei": "860123456789012",
+  "timestamp": 1706270400000,
+  "lat": 55.7558,
+  "lon": 37.6173,
+  "speed": 45,
+  "course": 180,
+  "altitude": 150,
+  "satellites": 12,
+  "retranslationTargetIds": [1, 3]
+}
+```
+
+> **Stels отправлял обработанную точку** (не raw бинарь). Формировал текстовый пакет Wialon IPS из GPSData → TCP. Мы делаем аналогично: обогащённый JSON → Kafka → Retranslation Service формирует выходной протокол.
+
+**Partitioning:** `hash(vehicleId) % 6`
 
 #### command-audit-log
 
@@ -1241,9 +1679,40 @@ psql -d tracker -f 15_device_daily_stats.sql
 
 # 4. Создать Kafka топики
 ./scripts/create_kafka_topics.sh
+
+# 5. Создать таблицу ретрансляции
+psql -d tracker_config -f 08_retranslation_targets.sql
 ```
 
 ---
 
-**Дата:** 26 января 2026  
-**Статус:** Data Stores документация готова ✅
+## 📋 Таблица ретрансляции (PostgreSQL)
+
+```sql
+-- 08_retranslation_targets.sql
+CREATE TABLE retranslation_targets (
+    id SERIAL PRIMARY KEY,
+    organization_id INTEGER NOT NULL REFERENCES organizations(id),
+    name VARCHAR(100) NOT NULL,
+    protocol VARCHAR(20) NOT NULL,       -- wialon_ips, egts, custom_http
+    host VARCHAR(255) NOT NULL,
+    port INTEGER NOT NULL,
+    is_active BOOLEAN DEFAULT true,
+    vehicle_ids INTEGER[] NOT NULL,      -- привязанные ТС
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_retranslation_org 
+    ON retranslation_targets (organization_id) 
+    WHERE is_active = true;
+
+COMMENT ON TABLE retranslation_targets IS 
+    'Цели ретрансляции GPS данных на внешние серверы. Аналог retranslator.json из legacy Stels';
+```
+
+---
+
+**Дата:** 12 февраля 2026  
+**Обновлено:** убран Redis Pub/Sub из MVP, добавлены поля устройства из Stels, добавлена ретрансляция  
+**Статус:** Data Stores документация обновлена ✅

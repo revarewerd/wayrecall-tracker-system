@@ -53,13 +53,13 @@ echo ""
 
 # 5. Создание Kafka топиков
 echo -e "${BLUE}[5/7]${NC} Создание Kafka топиков..."
-bash infra/scripts/create-kafka-topics.sh
+bash infra/kafka/create-topics.sh
 echo -e "${GREEN}✅ Kafka топики созданы${NC}"
 echo ""
 
 # 6. Инициализация TimescaleDB
 echo -e "${BLUE}[6/7]${NC} Инициализация TimescaleDB..."
-bash infra/scripts/init-timescaledb.sh
+bash infra/postgresql/init.sh
 echo -e "${GREEN}✅ TimescaleDB инициализирована${NC}"
 echo ""
 
