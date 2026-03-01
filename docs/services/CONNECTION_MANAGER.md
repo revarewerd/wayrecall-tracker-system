@@ -1,486 +1,545 @@
 # 🔌 Connection Manager — Детальная документация
 
 > **Блок:** 1 (Data Collection)  
-> **Порты:** TCP (один порт на инстанс, задаётся через CLI/env), HTTP 8090 (admin/metrics)  
+> **Порты:** TCP 5001-5015 (протоколы) + 5100 (multi-protocol) + 10090 (HTTP API)  
 > **Сложность:** Высокая  
-> **Статус:** 🟡 В разработке  
-> **Обновлено:** 12 февраля 2026
+> **Статус:** 🟢 Реализован (v4.0)  
+> **Тег:** `АКТУАЛЬНО` | **Обновлён:** 2 июня 2026 | **Версия:** 4.0
 
 ---
 
 ## 📋 Содержание
 
 1. [Обзор](#обзор)
-2. [Принцип работы](#принцип-работы)
-3. [Запуск и конфигурация](#запуск-и-конфигурация)
-4. [Архитектура компонентов](#архитектура-компонентов)
-5. [Протоколы трекеров](#протоколы-трекеров)
-6. [Обработка данных](#обработка-данных)
-7. [Типизированные ошибки парсинга (ADT)](#типизированные-ошибки-парсинга-adt)
+2. [Общая архитектура](#общая-архитектура)
+3. [Протоколы (18 штук)](#протоколы-18-штук)
+4. [Система команд (10 типов, 5 энкодеров)](#система-команд)
+5. [Kafka интеграция (10 топиков)](#kafka-интеграция)
+6. [Pipeline обработки точек](#pipeline-обработки-точек)
+7. [Мониторинг ошибок парсинга](#мониторинг-ошибок-парсинга)
 8. [Redis интеграция](#redis-интеграция)
-9. [Kafka интеграция](#kafka-интеграция)
-10. [API endpoints](#api-endpoints)
-11. [Масштабирование](#масштабирование)
-12. [Метрики и мониторинг](#метрики-и-мониторинг)
-13. [Post-MVP: GPS спуфинг-фильтр](#post-mvp-gps-спуфинг-фильтр)
+9. [API endpoints (20+)](#api-endpoints)
+10. [Масштабирование](#масштабирование)
+11. [Метрики и мониторинг](#метрики-и-мониторинг)
+12. [Конфигурация](#конфигурация)
+13. [Структура файлов](#структура-файлов)
+14. [Связанные документы](#-связанные-документы)
+15. [Post-MVP: GPS спуфинг-фильтр](#post-mvp-gps-спуфинг-фильтр)
 
 ---
 
 ## Обзор
 
-**Connection Manager** — сервис приёма GPS данных от трекеров. Каждый инстанс обслуживает **один протокол на одном порту**, что упрощает масштабирование и деплой.
+**Connection Manager (CM)** — центральный сервис приёма GPS данных от трекеров 18 различных протоколов. Принимает TCP-соединения, парсит бинарные/текстовые пакеты, обогащает данными из Redis, отправляет команды на трекеры и публикует события в 10 Kafka топиков.
 
 ### Ключевые характеристики
 
 | Параметр | Значение |
 |----------|----------|
-| **Протоколы** | Teltonika, Wialon IPS, Ruptela, NavTelecom (+ 6 Post-MVP) |
-| **Deployment** | Один инстанс = один протокол + один порт |
-| **Пропускная способность** | 10,000+ точек/сек на инстанс |
+| **Протоколы** | 18 (Teltonika, Wialon IPS/Binary/Adapter, Ruptela, NavTelecom, GoSafe, SkySim, AutophoneMayak, DTM, Galileosky, Concox, TK102, Arnavi, ADM, GTLT, MicroMayak) |
+| **Система команд** | 10 типов команд, 5 протокольных энкодеров (Teltonika, NavTelecom, DTM, Ruptela, Wialon) |
+| **Kafka** | 10 топиков: 8 produce (gps-events, gps-events-rules, gps-events-retranslation, gps-parse-errors, device-status, command-audit, unknown-devices, unknown-gps-events) + 2 consume (device-commands, device-events) |
+| **ALL-points** | ВСЕ точки → gps-events (включая невалидные/стационарные) с флагами `isValid`/`isMoving` |
+| **Multi-protocol** | Порт 5100: автодетекция протокола по magic bytes (quickDetect + fullDetect) |
+| **Пропускная способность** | 10,000+ точек/сек на кластер |
 | **Latency** | < 50ms (parse → Kafka) |
-| **Concurrent connections** | 3,000+ на инстанс |
-| **State** | Redis (кеш) + in-memory (pending commands) |
+| **Порты** | TCP 5001-5015 (протоколы), 5100 (multi), 10090 (HTTP API) |
+| **State** | Redis (кеш позиций, контекст) + in-memory (AwaitingCommand) |
 
 ---
 
-## Принцип работы
+## Общая архитектура
 
-### Один инстанс — один протокол
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        DEPLOYMENT МОДЕЛЬ                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  docker run -e CM_PROTOCOL=teltonika -e CM_PORT=5001 cm:latest          │
-│  docker run -e CM_PROTOCOL=wialon    -e CM_PORT=5002 cm:latest          │
-│  docker run -e CM_PROTOCOL=ruptela   -e CM_PORT=5003 cm:latest          │
-│  docker run -e CM_PROTOCOL=navtelecom -e CM_PORT=5004 cm:latest         │
-│                                                                         │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │
-│  │ CM Instance │ │ CM Instance │ │ CM Instance │ │ CM Instance │        │
-│  │ Teltonika   │ │ Wialon      │ │ Ruptela     │ │ NavTelecom  │        │
-│  │ :5001       │ │ :5002       │ │ :5003       │ │ :5004       │        │
-│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘ └──────┬──────┘        │
-│         │               │               │               │               │
-│         └───────────────┴───────┬───────┴───────────────┘               │
-│                                 ↓                                       │
-│                         ┌─────────────┐                                 │
-│                         │    Redis    │  ← Shared state                 │
-│                         │   (HASH)    │  ← device:{imei}                │
-│                         └─────────────┘                                 │
-│                                 ↓                                       │
-│                         ┌─────────────┐                                 │
-│                         │    Kafka    │  ← gps-events                   │
-│                         │             │  ← gps-events-rules             │
-│                         └─────────────┘                                 │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Data Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         CONNECTION MANAGER FLOW                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  1. TCP CONNECT + IMEI PACKET                                           │
-│     ─────────────────────────                                           │
-│     Трекер → TCP → parseImei() → Redis HGETALL device:{imei}            │
-│                                                                         │
-│     Результат = null → NACK + close (неизвестный трекер)                │
-│     Результат = DeviceData → ACK + записываем connection поля           │
-│                                                                         │
-│  2. DATA PACKET (loop)                                                  │
-│     ──────────────────                                                  │
-│     ┌─────────────────────────────────────────────────────────────┐     │
-│     │ 2.1 PARSE                                                   │     │
-│     │     parseData(buffer) → List[GpsRawPoint]                   │     │
-│     └─────────────────────────────────────────────────────────────┘     │
-│                                       ↓                                 │
-│     ┌─────────────────────────────────────────────────────────────┐     │
-│     │ 2.2 GET FRESH CONTEXT (на каждый пакет!)                    │     │
-│     │     Redis HGETALL device:{imei} → DeviceData                │     │
-│     │     (context + prev position за 1 запрос)                   │     │
-│     └─────────────────────────────────────────────────────────────┘     │
-│                                       ↓                                 │
-│     ┌─────────────────────────────────────────────────────────────┐     │
-│     │ 2.3 ENRICH                                                  │     │
-│     │     raw + context → GpsPoint                                │     │
-│     │     (vehicleId, orgId, speedLimit, hasGeozones,             │     │
-│     │      hasRetranslation, retranslationTargets, ...)           │     │
-│     └─────────────────────────────────────────────────────────────┘     │
-│                                       ↓                                 │
-│     ┌─────────────────────────────────────────────────────────────┐     │
-│     │ 2.4 VALIDATE + DEAD RECKONING FILTER                        │     │
-│     │     - Координаты валидны? Timestamp не в будущем?           │     │
-│     │     - Сравнение с prev position (из того же HGETALL)        │     │
-│     │     - Нет телепортации? Скорость < 300 км/ч?                │     │
-│     └─────────────────────────────────────────────────────────────┘     │
-│                                       ↓                                 │
-│     ┌─────────────────────────────────────────────────────────────┐     │
-│     │ 2.5 UPDATE REDIS (всегда, после валидации)                  │     │
-│     │     HMSET device:{imei} lat .. lon .. speed .. time ..      │     │
-│     │     (обновляем только position + lastActivity поля)         │     │
-│     └─────────────────────────────────────────────────────────────┘     │
-│                                       ↓                                 │
-│     ┌─────────────────────────────────────────────────────────────┐     │
-│     │ 2.6 KAFKA PUBLISH                                           │     │
-│     │                                                             │     │
-│     │     → gps-events (ВСЕГДА)                                   │     │
-│     │       Consumers: History Writer, WebSocket Service          │     │
-│     │                                                             │     │
-│     │     → gps-events-rules (если hasGeozones OR hasSpeedRules)  │     │
-│     │       Consumers: Geozones Service, Speed Alert Service      │     │
-│     │                                                             │     │
-│     │     → gps-events-retranslation (если hasRetranslation)      │     │
-│     │       Consumers: Integration Service                        │     │
-│     │       (retranslationTargets встраиваются в сообщение)       │     │
-│     │                                                             │     │
-│     └─────────────────────────────────────────────────────────────┘     │
-│                                       ↓                                 │
-│     ┌─────────────────────────────────────────────────────────────┐     │
-│     │ 2.7 ACK → трекеру, GOTO 2.1                                 │     │
-│     └─────────────────────────────────────────────────────────────┘     │
-│                                                                         │
-│  3. DISCONNECT                                                          │
-│     ──────────                                                          │
-│     Очищаем connection поля в Redis, публикуем device-status offline    │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Запуск и конфигурация
-
-### CLI аргументы
-
-```bash
-# Полный формат
-./connection-manager --protocol=teltonika --port=5001 --host=0.0.0.0
-
-# Минимальный (host по умолчанию 0.0.0.0)
-./connection-manager --protocol=wialon --port=5002
-```
-
-### Environment Variables (для Docker)
-
-```bash
-# Обязательные
-CM_PROTOCOL=teltonika          # teltonika|wialon|ruptela|navtelecom
-CM_PORT=5001                   # TCP порт для трекеров
-
-# Инфраструктура
-REDIS_HOST=redis               # Redis сервер
-REDIS_PORT=6379
-KAFKA_BROKERS=kafka:9092       # Kafka брокеры
-
-# Опциональные
-CM_INSTANCE_ID=cm-teltonika-1  # ID инстанса (по умолчанию: hostname)
-CM_ADMIN_PORT=8090             # Порт для health/metrics
-TCP_WORKER_THREADS=4           # Netty worker threads
-TCP_BOSS_THREADS=1             # Netty boss threads
-LOG_LEVEL=INFO
-```
-
-### Docker Compose пример
-
-```yaml
-services:
-  cm-teltonika:
-    image: wayrecall/connection-manager:latest
-    ports:
-      - "5001:5001"
-      - "8091:8090"
-    environment:
-      - CM_PROTOCOL=teltonika
-      - CM_PORT=5001
-      - CM_INSTANCE_ID=cm-teltonika-1
-      - REDIS_HOST=redis
-      - KAFKA_BROKERS=kafka:9092
-    depends_on:
-      - redis
-      - kafka
-
-  cm-wialon:
-    image: wayrecall/connection-manager:latest
-    ports:
-      - "5002:5002"
-      - "8092:8090"
-    environment:
-      - CM_PROTOCOL=wialon
-      - CM_PORT=5002
-      - CM_INSTANCE_ID=cm-wialon-1
-      - REDIS_HOST=redis
-      - KAFKA_BROKERS=kafka:9092
-    depends_on:
-      - redis
-      - kafka
-```
-
----
-
-## Архитектура компонентов
+### Архитектура компонентов
 
 ```mermaid
 flowchart TB
-    subgraph External["Внешний мир"]
-        T1[Teltonika трекеры]
-        T2[Wialon трекеры]
-        T3[Ruptela трекеры]
-        T4[NavTelecom трекеры]
+    subgraph External["GPS трекеры (18 протоколов)"]
+        T1[Teltonika :5001]
+        T2[Wialon IPS :5002]
+        T3[Ruptela :5003]
+        T4["NavTelecom :5004"]
+        T5["... ещё 12 протоколов :5005-5015"]
+        TM[Multi-protocol :5100]
     end
 
     subgraph CM["Connection Manager"]
-        subgraph TCP["TCP Servers (Netty)"]
-            P5001[":5001 Teltonika"]
-            P5002[":5002 Wialon"]
-            P5003[":5003 Ruptela"]
-            P5004[":5004 NavTelecom"]
+        subgraph TCP["TCP Servers (Netty 4.1)"]
+            S1[ServerBootstrap ×16]
+            SM[MultiProtocol ServerBootstrap]
         end
 
-        subgraph Handlers["Protocol Handlers"]
-            TH[TeltonikaHandler]
-            WH[WialonHandler]
-            RH[RuptelaHandler]
-            NH[NavTelecomHandler]
+        subgraph Detect["Protocol Detection"]
+            MPP[MultiProtocolParser]
+            QD[quickDetect: magic bytes]
+            FD[fullDetect: deep analysis]
+        end
+
+        subgraph Parsers["16 Protocol Parsers"]
+            PP[TeltonikaParser, WialonParser, RuptelaParser, NavTelecomParser, GoSafeParser, SkySimParser, AutophoneMayakParser, DtmParser, GalileoskyParser, ConcoxParser, TK102Parser, ArnaviParser, AdmParser, GtltParser, MicroMayakParser, WialonBinaryParser]
         end
 
         subgraph Pipeline["Processing Pipeline"]
-            Parser[Protocol Parser]
-            Validator[IMEI Validator]
-            DRFilter[Dead Reckoning Filter]
-            SFilter[Stationary Filter]
-            Enricher[Data Enricher]
+            CH[ConnectionHandler]
+            DR[Dead Reckoning Filter]
+            SF[Stationary Filter]
+            EN[Enricher + DeviceData]
+        end
+
+        subgraph CmdSys["Command System"]
+            CE[CommandEncoder.forProtocol]
+            TE[TeltonikaEncoder]
+            NE[NavTelecomEncoder]
+            DE[DtmEncoder]
+            RE[RuptelaEncoder]
+            WE[WialonEncoder]
+            RO[ReceiveOnlyEncoder ×13]
         end
 
         subgraph Output["Output Layer"]
-            KP[Kafka Producer]
-            RC[Redis Client]
+            KP[KafkaProducer → 8 топиков]
+            KC[KafkaConsumer ← device-commands]
+            RC[RedisClient → device:{imei}]
         end
 
-        Admin[":8090 Admin API"]
+        API[":10090 HTTP API (20+ endpoints)"]
     end
 
-    subgraph Storage["Внешние системы"]
-        Redis[(Redis)]
-        Kafka[(Kafka)]
+    subgraph Storage["Инфраструктура"]
+        Redis[(Redis 7.0)]
+        Kafka[(Kafka 3.4+)]
     end
 
-    T1 --> P5001 --> TH
-    T2 --> P5002 --> WH
-    T3 --> P5003 --> RH
-    T4 --> P5004 --> NH
-
-    TH & WH & RH & NH --> Parser
-    Parser --> Validator
-    Validator --> DRFilter
-    DRFilter --> SFilter
-    SFilter --> Enricher
-    Enricher --> KP & RC
-
+    T1 & T2 & T3 & T4 & T5 --> S1
+    TM --> SM --> MPP
+    MPP --> QD --> FD
+    S1 & FD --> PP
+    PP --> CH
+    CH --> DR --> SF --> EN
+    EN --> KP & RC
+    KC --> CE
+    CE --> TE & NE & DE & RE & WE & RO
     KP --> Kafka
     RC --> Redis
-    Validator -.-> Redis
+    KC -.-> Kafka
 ```
 
-### Компоненты
-
-| Компонент | Описание | Технология |
-|-----------|----------|------------|
-| **TCP Servers** | Приём соединений от трекеров | Netty NIO |
-| **Protocol Handlers** | Codec для каждого протокола | ZIO + Netty |
-| **Parser** | Парсинг бинарных пакетов → GpsPoint | Pure Scala |
-| **IMEI Validator** | Проверка IMEI в Redis/PostgreSQL | ZIO + Redis |
-| **Dead Reckoning Filter** | Валидация координат | Pure Scala |
-| **Stationary Filter** | Определение движение/стоянка | Pure Scala |
-| **Data Enricher** | Добавление метаданных | Pure Scala |
-| **Kafka Producer** | Публикация в топики | zio-kafka |
-| **Kafka Consumer** | Получение команд (device-commands) | zio-kafka (Static Partition) |
-| **Command Handler** | Отправка команд на трекеры + pending queue | ZIO + Redis |
-| **Redis Client** | Кеш позиций, backup команд | zio-redis |
-
----
-
-## Протоколы трекеров
-
-### Teltonika (порт 5001)
+### Data Flow: GPS пакет → Kafka
 
 ```mermaid
 sequenceDiagram
-    participant T as Teltonika Tracker
-    participant CM as Connection Manager
+    participant T as GPS Трекер
+    participant CM as ConnectionHandler
+    participant P as ProtocolParser
     participant R as Redis
     participant K as Kafka
 
     T->>CM: TCP Connect
-    T->>CM: IMEI packet (17 bytes)
-    CM->>R: HGET connection_registry {imei}
+    T->>CM: IMEI пакет
+    CM->>R: HGETALL device:{imei}
     
-    alt IMEI не зарегистрирован
-        CM->>R: Lookup vehicle:{imei}
-        R-->>CM: vehicle_id или null
-        alt vehicle_id найден
-            CM->>R: HSET connection_registry {imei} {instance}
-            CM-->>T: 0x01 (accepted)
-        else vehicle_id не найден
-            CM-->>T: 0x00 (rejected)
-            CM->>CM: Close connection
-        end
-    else IMEI уже подключен
-        CM-->>T: 0x01 (accepted)
+    alt IMEI зарегистрирован
+        R-->>CM: DeviceData (context + prev position)
+        CM-->>T: ACK (протокол-специфичный)
+        CM->>R: HMSET connection fields
+        CM->>K: device-status "online"
+    else IMEI неизвестен
+        CM-->>T: NACK
+        CM->>K: unknown-devices
+        CM->>CM: Close connection
     end
 
-    loop GPS данные
-        T->>CM: AVL Data packet
-        CM->>CM: Parse Codec8/Codec8E
-        Note over CM: Может быть 1-100+ точек в пакете
-        CM->>CM: Validate coordinates
-        CM->>CM: Check stationary
-        CM->>R: SET position:{vehicle_id} {json}
-        CM->>K: Publish gps-events
-        CM-->>T: ACK (count of points)
+    loop Каждый GPS пакет
+        T->>CM: Data пакет (binary/text)
+        CM->>P: parse(buffer)
+        
+        alt Парсинг успешен
+            P-->>CM: List[GpsRawPoint]
+            CM->>R: HGETALL device:{imei} (fresh context)
+            CM->>CM: Enrich + Validate + Filter
+            CM->>K: gps-events (ВСЕ точки!)
+            CM->>K: gps-events-rules (если isMoving + hasGeozones)
+            CM->>K: gps-events-retranslation (если isMoving + hasRetranslation)
+            CM->>R: HMSET position fields
+            CM-->>T: ACK
+        else Ошибка парсинга
+            P-->>CM: ProtocolError
+            CM->>K: gps-parse-errors (hex dump + error type)
+            CM-->>T: ACK/NACK (зависит от протокола)
+        end
     end
 
     T->>CM: Disconnect
-    CM->>R: HDEL connection_registry {imei}
-    CM->>K: Publish device-status (offline)
+    CM->>R: HDEL connection fields
+    CM->>K: device-status "offline"
 ```
 
-#### Teltonika Codec8 Extended
+### Жизненный цикл соединения
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                      AVL Data Packet                               │
-├──────────┬──────────┬──────────────────────────────────────────────┤
-│ Preamble │ Data Len │              AVL Data                        │
-│ 4 bytes  │ 4 bytes  │              Variable                        │
-│ 00000000 │          │                                              │
-├──────────┴──────────┼──────────────────────────────────────────────┤
-│                     │  ┌─────────────────────────────────────────┐ │
-│                     │  │ Codec ID: 0x8E (Codec8 Extended)        │ │
-│                     │  │ Number of Data 1: count                 │ │
-│                     │  │ AVL Data[]:                             │ │
-│                     │  │   - Timestamp (8 bytes)                 │ │
-│                     │  │   - Priority (1 byte)                   │ │
-│                     │  │   - GPS Element:                        │ │
-│                     │  │     - Longitude (4 bytes, int * 10^-7)  │ │
-│                     │  │     - Latitude (4 bytes, int * 10^-7)   │ │
-│                     │  │     - Altitude (2 bytes)                │ │
-│                     │  │     - Angle (2 bytes)                   │ │
-│                     │  │     - Satellites (1 byte)               │ │
-│                     │  │     - Speed (2 bytes)                   │ │
-│                     │  │   - IO Element (variable)               │ │
-│                     │  │ Number of Data 2: count                 │ │
-│                     │  │ CRC-16 (4 bytes)                        │ │
-│                     │  └─────────────────────────────────────────┘ │
-└─────────────────────┴──────────────────────────────────────────────┘
-```
-
-### Wialon IPS (порт 5002)
-
-```
-Формат: текстовый, разделитель ";"
-
-Login:    #L#imei;password\r\n
-Response: #AL#1\r\n (success) или #AL#0\r\n (fail)
-
-Data:     #D#date;time;lat1;lat2;lon1;lon2;speed;course;alt;sats;hdop;inputs;outputs;adc;ibutton;params\r\n
-Response: #AD#1\r\n
-
-Short:    #SD#date;time;lat1;lat2;lon1;lon2;speed;course;alt;sats\r\n
-Response: #ASD#1\r\n
-
-Ping:     #P#\r\n
-Response: #AP#\r\n
-```
-
-### Ruptela (порт 5003)
-
-```
-Бинарный протокол, структура пакета:
-- Length (2 bytes, big-endian)
-- IMEI (8 bytes, BCD)
-- Command ID (1 byte)
-- Payload (variable)
-- CRC-16 (2 bytes)
-
-Command IDs:
-- 0x01: Records
-- 0x02: Extended Records
-- 0x41: SMS from server
-- 0x42: SMS response
-```
-
-### NavTelecom (порт 5004)
-
-```
-Бинарный протокол FLEX:
-- Signature: "@NTC"
-- Receiver ID (4 bytes)
-- Sender ID (4 bytes)
-- Packet Length (2 bytes)
-- Packet Flags (1 byte)
-- Header CRC (1 byte)
-- Service ID (1 byte)
-- Packet Type (1 byte)
-- Payload
-- Data CRC (1 byte)
+```mermaid
+stateDiagram-v2
+    [*] --> Connecting: TCP SYN
+    Connecting --> Authenticating: IMEI пакет получен
+    Authenticating --> Active: IMEI найден в Redis
+    Authenticating --> Rejected: IMEI неизвестен
+    Rejected --> [*]: close + unknown-devices
+    
+    Active --> Receiving: Data пакет
+    Receiving --> Active: ACK отправлен
+    Active --> SendingCommand: Команда из Kafka
+    SendingCommand --> WaitingResponse: Отправлена по TCP
+    WaitingResponse --> Active: Ответ получен / timeout
+    
+    Active --> Idle: Нет данных > idle-timeout
+    Idle --> Active: Data пакет получен
+    Idle --> Disconnected: Timeout
+    Active --> Disconnected: TCP error / client close
+    
+    Disconnected --> [*]: cleanup Redis + device-status offline
 ```
 
 ---
 
-## Обработка данных
+## Протоколы (18 штук)
 
-### Pipeline обработки
+### Сводная таблица
+
+| # | Протокол | Порт | Тип | Парсер | Энкодер | Кол-во команд |
+|---|----------|------|-----|--------|---------|:-------------:|
+| 1 | Teltonika Codec 8/8E | 5001 | binary | TeltonikaParser | TeltonikaEncoder | 5 |
+| 2 | Wialon IPS | 5002 | text | WialonParser | WialonEncoder | 1 |
+| 3 | Ruptela | 5003 | binary | RuptelaParser | RuptelaEncoder | 3 |
+| 4 | NavTelecom FLEX | 5004 | binary | NavTelecomParser | NavTelecomEncoder | 3 |
+| 5 | GoSafe | 5005 | text | GoSafeParser | ReceiveOnly | 0 |
+| 6 | SkySim | 5006 | text | SkySimParser | ReceiveOnly | 0 |
+| 7 | AutophoneMayak | 5007 | binary | AutophoneMayakParser | ReceiveOnly | 0 |
+| 8 | DTM | 5008 | binary | DtmParser | DtmEncoder | 2 |
+| 9 | Galileosky | 5009 | binary | GalileoskyParser | ReceiveOnly | 0 |
+| 10 | Concox | 5010 | binary | ConcoxParser | ReceiveOnly | 0 |
+| 11 | TK102 | 5011 | text | TK102Parser | ReceiveOnly | 0 |
+| 12 | Arnavi | 5012 | binary | ArnaviParser | ReceiveOnly | 0 |
+| 13 | ADM | 5013 | binary | AdmParser | ReceiveOnly | 0 |
+| 14 | GTLT | 5014 | text | GtltParser | ReceiveOnly | 0 |
+| 15 | MicroMayak | 5015 | binary | MicroMayakParser | ReceiveOnly | 0 |
+| 16 | Wialon Binary | 5002* | binary | WialonBinaryParser | WialonEncoder | 1 |
+| 17 | Wialon Adapter | — | text | WialonAdapterParser | WialonEncoder | 1 |
+| 18 | Multi-protocol | 5100 | auto | MultiProtocolParser | — | — |
+
+> \* Wialon Binary разделяет порт с Wialon IPS (определяется по первым байтам)
+
+### Матрица поддержки команд
 
 ```mermaid
 flowchart LR
-    subgraph Input
-        Raw[Raw Bytes]
+    subgraph Commands["10 типов команд"]
+        C1[Reboot]
+        C2[SetInterval]
+        C3[RequestPosition]
+        C4[SetOutput]
+        C5[SetParameter]
+        C6[Password]
+        C7[DeviceConfig]
+        C8[ChangeServer]
+        C9[Custom]
+        C10[BlockEngine]
     end
 
-    subgraph Parse["1. Parse"]
-        P1[Decode Protocol]
-        P2[Extract Points]
+    subgraph Encoders["5 энкодеров"]
+        TE[TeltonikaEncoder<br/>Codec 12]
+        NE[NavTelecomEncoder<br/>NTCB FLEX]
+        DE[DtmEncoder<br/>Binary IOSwitch]
+        RE[RuptelaEncoder<br/>Binary 0x65/0x66/0x67]
+        WE[WialonEncoder<br/>Text #M#]
     end
 
-    subgraph Validate["2. Validate"]
+    C1 --> TE & NE
+    C4 --> TE & NE & DE & RE
+    C5 --> TE
+    C6 --> NE
+    C9 --> TE & NE & WE
+    C10 --> DE
+```
+
+### Автодетекция (MultiProtocolParser)
+
+```mermaid
+flowchart TD
+    Start[Получены байты на :5100] --> QD{quickDetect<br/>magic bytes}
+    
+    QD -->|0x00 0x00 0x00 0x00| Teltonika
+    QD -->|0x23 '#'| WialonGroup{Wialon IPS/Short/Ping}
+    QD -->|0x00 + BCD IMEI| Ruptela
+    QD -->|0x40 0x4E 0x54 0x43 '@NTC'| NavTelecom
+    QD -->|'$' ASCII| GoSafe
+    QD -->|0x78 0x78 / 0x79 0x79| Concox
+    QD -->|0x01 + header| Galileosky
+    QD -->|0x7B '{' binary| DTM
+    QD -->|'*HQ' text| TK102
+    QD -->|0xFF + header| Arnavi
+    QD -->|не определён| FD{fullDetect<br/>deep analysis}
+    
+    FD -->|"SkySim pattern"| SkySim
+    FD -->|"ADM header"| ADM
+    FD -->|"GTLT pattern"| GTLT
+    FD -->|"Mayak header"| AutophoneMayak
+    FD -->|"Binary Mayak"| MicroMayak
+    FD -->|"Wialon Binary"| WialonBinary
+    FD -->|"Все парсеры failed"| Unknown[Reject + close]
+```
+
+### Legacy STELS → CM маппинг портов
+
+| Legacy (STELS) | CM порт | Протокол | Статус |
+|:-:|:-:|----------|--------|
+| — | 5001 | Teltonika | ✅ |
+| — | 5002 | Wialon IPS | ✅ |
+| — | 5003 | Ruptela | ✅ |
+| 5113 | 5004 | NavTelecom FLEX | ✅ |
+| — | 5005 | GoSafe | ✅ |
+| — | 5006 | SkySim | ✅ |
+| 5115 | 5007 | AutophoneMayak | ✅ |
+| — | 5008 | DTM | ✅ |
+| 5112 | 5009 | Galileosky | ✅ |
+| — | 5010 | Concox | ✅ |
+| — | 5011 | TK102 | ✅ |
+| 5114 | 5012 | Arnavi | ✅ |
+| 5111 | 5013 | ADM | ✅ |
+| — | 5014 | GTLT | ✅ |
+| — | 5015 | MicroMayak | ✅ |
+
+---
+
+## Система команд
+
+### 10 типов команд (domain/Command.scala)
+
+```mermaid
+classDiagram
+    class Command {
+        <<sealed trait>>
+        +commandId: String
+        +deviceId: Long
+        +imei: String
+        +delivery: CommandDelivery
+        +priority: Int
+    }
+    
+    Command <|-- RebootCommand
+    Command <|-- SetIntervalCommand
+    Command <|-- RequestPositionCommand
+    Command <|-- SetOutputCommand
+    Command <|-- SetParameterCommand
+    Command <|-- PasswordCommand
+    Command <|-- DeviceConfigCommand
+    Command <|-- ChangeServerCommand
+    Command <|-- CustomCommand
+    Command <|-- BlockEngineCommand
+
+    class CommandDelivery {
+        <<enum>>
+        Tcp
+        Sms
+        Auto
+    }
+    
+    class CommandEncoder {
+        <<trait>>
+        +encode(command: Command): Either[String, Array[Byte]]
+        +forProtocol(name: String): CommandEncoder
+    }
+    
+    CommandEncoder <|-- TeltonikaEncoder
+    CommandEncoder <|-- NavTelecomEncoder
+    CommandEncoder <|-- DtmEncoder
+    CommandEncoder <|-- RuptelaEncoder
+    CommandEncoder <|-- WialonEncoder
+    CommandEncoder <|-- ReceiveOnlyEncoder
+```
+
+### 5 энкодеров (command/ package)
+
+| Энкодер | Формат | Протоколы | Команды |
+|---------|--------|-----------|---------|
+| **TeltonikaEncoder** | Codec 12 binary | Teltonika | `cpureset`, `setparam`, `getrecord`, `setdigout`, custom |
+| **NavTelecomEncoder** | NTCB FLEX text | NavTelecom | `>PASS:{password}`, `!{n}Y/N`, custom |
+| **DtmEncoder** | Binary IOSwitch `[0x7B][Len][0xFF][XOR][cmd][val][0x7D]` | DTM | SetOutput, BlockEngine |
+| **RuptelaEncoder** | Binary commands `0x65/0x66/0x67` | Ruptela | SetOutput, SMS forward, config |
+| **WialonEncoder** | Text `#M#{text}\r\n` | Wialon IPS, Binary, Adapter | Custom text |
+| **ReceiveOnlyEncoder** | — | 13 протоколов | → `UnsupportedProtocol` |
+
+### Поток команды (device-commands → трекер)
+
+```mermaid
+sequenceDiagram
+    participant DM as Device Manager
+    participant K as Kafka device-commands
+    participant CM as Connection Manager
+    participant CE as CommandEncoder
+    participant T as GPS Трекер
+    participant R as Redis
+
+    DM->>K: PublishCommand (key=instanceId, partition=static)
+    K->>CM: ConsumeCommand (Static Partition Assignment)
+    
+    CM->>CM: Lookup connection by IMEI
+    
+    alt Трекер онлайн
+        CM->>CE: CommandEncoder.forProtocol("teltonika")
+        CE-->>CM: TeltonikaEncoder
+        CM->>CE: encode(SetOutputCommand)
+        CE-->>CM: Codec 12 bytes
+        CM->>T: TCP write (binary)
+        T-->>CM: ACK / response
+        CM->>K: command-audit (success)
+    else Трекер офлайн
+        CM->>R: ZADD pending_commands:{imei} (score=priority)
+        Note over CM: При следующем подключении:<br/>Redis ZRANGEBYSCORE + in-memory merge<br/>→ deduplicate by commandId<br/>→ send all pending
+    end
+```
+
+---
+
+## Kafka интеграция
+
+### 10 Kafka топиков
+
+```mermaid
+flowchart LR
+    subgraph CM["Connection Manager"]
+        GPS[GPS пакет]
+        Parse[Parse]
+        Err[Parse Error]
+        Enrich[Enrich + Filter]
+        Cmd[Command Handler]
+    end
+
+    subgraph ProduceTopics["Produce (8 топиков)"]
+        GE[gps-events<br/>ВСЕ точки]
+        GR[gps-events-rules<br/>isMoving + hasGeozones]
+        GT[gps-events-retranslation<br/>isMoving + hasRetranslation]
+        GPE[gps-parse-errors<br/>hex dump + error type]
+        DS[device-status<br/>online/offline]
+        CA[command-audit<br/>результат команды]
+        UD[unknown-devices<br/>неизвестный IMEI]
+        UGE[unknown-gps-events<br/>GPS от неизвестных]
+    end
+
+    subgraph ConsumeTopics["Consume (2 топика)"]
+        DC[device-commands<br/>Static Partition]
+        DE[device-events<br/>CRUD устройств]
+    end
+
+    GPS --> Parse
+    Parse -->|ok| Enrich
+    Parse -->|error| Err --> GPE
+    Enrich --> GE
+    Enrich -->|"isMoving + rules"| GR
+    Enrich -->|"isMoving + retrans"| GT
+    Enrich -->|disconnect| DS
+    Enrich -->|unknown IMEI| UD
+    Enrich -->|unknown GPS| UGE
+    DC --> Cmd --> CA
+    DE --> CM
+```
+
+### Семантика ALL-points → gps-events
+
+> **Изменение v4.0:** gps-events получает **ВСЕ** точки (включая невалидные и стационарные).
+> Поля `isValid` и `isMoving` позволяют consumers фильтровать нужное.
+
+| Точка | isValid | isMoving | → gps-events | → gps-events-rules | → gps-events-retranslation |
+|-------|:-------:|:--------:|:------------:|:-------------------:|:--------------------------:|
+| Нормальная движущаяся | ✅ | ✅ | ✅ | ✅ (если flags) | ✅ (если flags) |
+| Стационарная (стоянка) | ✅ | ❌ | ✅ | ❌ | ❌ |
+| Невалидная (teleport) | ❌ | — | ✅ | ❌ | ❌ |
+| Parse error | — | — | ❌ | ❌ | ❌ → **gps-parse-errors** |
+
+### Логика публикации
+
+```scala
+def processPoint(point: GpsPoint): Task[Unit] = for {
+  // 1. ВСЕ точки → gps-events (для TimescaleDB полной истории)
+  _ <- kafkaProducer.publish("gps-events", point.vehicleId.toString, point.toJson)
+  
+  // 2. Только движущиеся + с правилами → gps-events-rules
+  _ <- ZIO.when(point.isMoving && (point.hasGeozones || point.hasSpeedRules))(
+         kafkaProducer.publish("gps-events-rules", point.vehicleId.toString, point.toJson)
+       )
+  
+  // 3. Только движущиеся + с ретрансляцией → gps-events-retranslation
+  _ <- ZIO.when(point.isMoving && point.hasRetranslation)(
+         kafkaProducer.publish("gps-events-retranslation", point.vehicleId.toString, point.toJson)
+       )
+} yield ()
+```
+
+### Топики: полная спецификация
+
+| Топик | Партиции | Retention | Key | Условие | Consumers |
+|-------|:--------:|-----------|-----|---------|-----------|
+| `gps-events` | 12 | 7 дней | vehicleId | **ВСЕ** точки | History Writer, WebSocket, Analytics |
+| `gps-events-rules` | 6 | 1 день | vehicleId | isMoving + (hasGeozones ∨ hasSpeedRules) | Rule Checker, Geozones |
+| `gps-events-retranslation` | 6 | 1 день | vehicleId | isMoving + hasRetranslation | Integration Service |
+| `gps-parse-errors` | 3 | 3 дня | imei | Ошибка парсинга | Admin Service, Grafana |
+| `device-status` | 6 | 30 дней | imei | Connect/Disconnect | Notification, History Writer |
+| `command-audit` | 3 | 90 дней | deviceId | Результат команды | Аудит-лог |
+| `unknown-devices` | 3 | 7 дней | imei | IMEI не в Redis | Device Manager |
+| `unknown-gps-events` | 6 | 30 дней | imei | GPS от незарег. трекеров | History Writer, Device Manager |
+
+> Подробнее: [infra/kafka/TOPICS.md](../../infra/kafka/TOPICS.md)
+
+---
+
+## Pipeline обработки точек
+
+```mermaid
+flowchart LR
+    subgraph Input["1. Input"]
+        Raw[Raw Bytes<br/>от трекера]
+    end
+
+    subgraph Parse["2. Parse"]
+        P1[ProtocolParser.parse]
+        PE[Parse Error?]
+    end
+
+    subgraph Validate["3. Validate"]
         V1[Check Coordinates]
         V2[Check Timestamp]
-        V3[Check Speed]
+        V3[Dead Reckoning]
     end
 
-    subgraph Filter["3. Filter"]
-        F1[Dead Reckoning]
-        F2[Stationary Check]
+    subgraph Filter["4. Filter"]
+        F1[Stationary Check]
+        F2[Set isMoving/isValid]
     end
 
-    subgraph Enrich["4. Enrich"]
-        E1[Add Metadata]
-        E2[Add Sensors]
+    subgraph Enrich["5. Enrich"]
+        E1[DeviceData from Redis]
+        E2[Add metadata]
     end
 
-    subgraph Output["5. Output"]
-        O1[Redis Cache]
-        O2[Kafka Events]
+    subgraph Output["6. Output"]
+        O1[Redis: update position]
+        O2[Kafka: gps-events ALL]
+        O3[Kafka: rules/retrans]
+        O4[Kafka: gps-parse-errors]
     end
 
-    Raw --> P1 --> P2
-    P2 --> V1 --> V2 --> V3
+    Raw --> P1
+    P1 -->|ok| V1
+    P1 -->|error| PE --> O4
+    V1 --> V2 --> V3
     V3 --> F1 --> F2
     F2 --> E1 --> E2
-    E2 --> O1 & O2
+    E2 --> O1
+    E2 --> O2
+    E2 -->|isMoving + flags| O3
 ```
 
 ### GpsRawPoint → GpsPoint (обогащение)
 
 ```scala
-/**
- * Сырая точка из парсера (без контекста)
- */
 case class GpsRawPoint(
   imei: String,
   latitude: Double,
@@ -493,204 +552,88 @@ case class GpsRawPoint(
   sensors: SensorData
 )
 
-/**
- * Обогащённая точка (для Redis + Kafka)
- */
 case class GpsPoint(
-  // Идентификация (из DeviceData context)
-  vehicleId: Long,
-  organizationId: Long,
+  vehicleId: Long,          // из DeviceData
+  organizationId: Long,     // из DeviceData
   imei: String,
-  
-  // Координаты (из raw)
   latitude: Double,
   longitude: Double,
   altitude: Option[Int],
   speed: Int,
   course: Int,
   satellites: Option[Int],
-  
-  // Время
-  deviceTime: Instant,      // Время на трекере (из raw)
-  serverTime: Instant,      // Время получения сервером
-  
-  // Флаги для downstream (из DeviceData context)
-  speedLimit: Option[Int],        // Для проверки превышения
-  hasGeozones: Boolean,           // Маркер → gps-events-rules
-  hasSpeedRules: Boolean,         // Маркер → gps-events-rules
-  
-  // Статус (вычисляется)
+  deviceTime: Instant,
+  serverTime: Instant,
+  speedLimit: Option[Int],        // из DeviceData
+  hasGeozones: Boolean,           // маркер → gps-events-rules
+  hasSpeedRules: Boolean,         // маркер → gps-events-rules
+  hasRetranslation: Boolean,      // маркер → gps-events-retranslation
+  retranslationTargets: Option[List[String]],
   isMoving: Boolean,              // Stationary filter
   isValid: Boolean,               // Dead Reckoning filter
   validationError: Option[String],
-  
-  // Датчики (из raw, возможно обогащённые калибровкой)
   sensors: SensorData,
-  
-  // Метаданные
-  protocol: String,               // Из CLI/env
-  instanceId: String              // Из CLI/env
-)
-
-/**
- * Обогащение raw → enriched
- */
-def enrich(raw: GpsRawPoint, context: DeviceData, protocol: String, instanceId: String): GpsPoint =
-  GpsPoint(
-    vehicleId = context.vehicleId,
-    organizationId = context.organizationId,
-    imei = raw.imei,
-    latitude = raw.latitude,
-    longitude = raw.longitude,
-    altitude = raw.altitude,
-    speed = raw.speed,
-    course = raw.course,
-    satellites = raw.satellites,
-    deviceTime = raw.deviceTime,
-    serverTime = Instant.now,
-    speedLimit = context.speedLimit,
-    hasGeozones = context.hasGeozones,
-    hasSpeedRules = context.hasSpeedRules,
-    isMoving = true,  // будет определено Stationary filter
-    isValid = true,   // будет определено Dead Reckoning filter
-    validationError = None,
-    sensors = raw.sensors,  // TODO: применить калибровку из context.sensorConfig
-    protocol = protocol,
-    instanceId = instanceId
-  )
-```
-
-case class SensorData(
-  ignition: Option[Boolean],
-  fuel: Option[Double],
-  temperature: Option[Double],
-  battery: Option[Double],
-  externalPower: Option[Boolean],
-  doors: Option[Boolean],
-  raw: JsonObject              // Все остальные IO параметры
+  protocol: String,
+  instanceId: String
 )
 ```
 
-### Dead Reckoning Filter
+---
+
+## Мониторинг ошибок парсинга
+
+### Топик gps-parse-errors (NEW v4.0)
+
+При ошибке парсинга GPS пакета ConnectionHandler ловит исключение через `foldZIO` и публикует в `gps-parse-errors`:
 
 ```scala
-object DeadReckoningFilter {
-  
-  case class ValidationResult(
-    isValid: Boolean,
-    error: Option[String]
-  )
-  
-  def validate(
-    current: GpsPoint,
-    previous: Option[GpsPoint]
-  ): ValidationResult = {
-    
-    // 1. Проверка границ координат
-    if (current.latitude < -90 || current.latitude > 90 ||
-        current.longitude < -180 || current.longitude > 180) {
-      return ValidationResult(false, Some("INVALID_COORDS"))
-    }
-    
-    // 2. Проверка нулевых координат (GPS потерял фиксацию)
-    if (current.latitude == 0.0 && current.longitude == 0.0) {
-      return ValidationResult(false, Some("NULL_ISLAND"))
-    }
-    
-    // 3. Проверка телепортации (если есть предыдущая точка)
-    previous.foreach { prev =>
-      val distance = haversineDistance(
-        prev.latitude, prev.longitude,
-        current.latitude, current.longitude
-      )
-      val timeDiff = Duration.between(prev.deviceTime, current.deviceTime)
-      val speed = distance / timeDiff.getSeconds  // м/с
-      
-      // Максимум 300 км/ч = 83 м/с
-      if (speed > 83 && timeDiff.getSeconds < 60) {
-        return ValidationResult(false, Some("TELEPORT"))
-      }
-    }
-    
-    // 4. Проверка скорости (самолёт?)
-    if (current.speed > 300) {
-      return ValidationResult(false, Some("IMPOSSIBLE_SPEED"))
-    }
-    
-    ValidationResult(true, None)
-  }
-  
-  private def haversineDistance(
-    lat1: Double, lon1: Double,
-    lat2: Double, lon2: Double
-  ): Double = {
-    val R = 6371000 // радиус Земли в метрах
-    val dLat = Math.toRadians(lat2 - lat1)
-    val dLon = Math.toRadians(lon2 - lon1)
-    val a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-            Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
-            Math.sin(dLon/2) * Math.sin(dLon/2)
-    val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a))
-    R * c
-  }
-}
+// В ConnectionHandler.processDataPacket:
+parser.parse(buffer).foldZIO(
+  error => for {
+    hexDump <- ZIO.succeed(bytesToHex(buffer, maxBytes = 512))
+    event = GpsParseErrorEvent(
+      imei = imei,
+      protocol = protocolName,
+      errorType = mapErrorType(error),
+      errorMessage = error.getMessage,
+      rawPacketHex = hexDump,
+      rawPacketSize = buffer.readableBytes(),
+      remoteAddress = remoteAddr,
+      instanceId = instanceId,
+      timestamp = Instant.now
+    )
+    _ <- kafkaProducer.publishParseError(event)
+  } yield List.empty,
+  points => ZIO.succeed(points)
+)
 ```
 
-### Stationary Filter
+### Типы ошибок (ProtocolError ADT)
 
-```scala
-object StationaryFilter {
-  
-  case class StationaryResult(
-    isMoving: Boolean,
-    parkingStartTime: Option[Instant]
-  )
-  
-  // Параметры
-  val SPEED_THRESHOLD = 3        // км/ч — меньше = стоим
-  val DISTANCE_THRESHOLD = 50    // метров — радиус "стоянки"
-  val MIN_PARKING_DURATION = 60  // секунд — минимум для стоянки
-  
-  def check(
-    current: GpsPoint,
-    previous: Option[GpsPoint],
-    parkingState: Option[ParkingState]
-  ): (StationaryResult, Option[ParkingState]) = {
-    
-    // Простая проверка по скорости
-    if (current.speed <= SPEED_THRESHOLD) {
-      // Возможно стоим
-      parkingState match {
-        case Some(state) =>
-          // Уже в режиме стоянки — проверяем расстояние
-          val dist = haversineDistance(
-            state.anchorLat, state.anchorLon,
-            current.latitude, current.longitude
-          )
-          if (dist < DISTANCE_THRESHOLD) {
-            // Всё ещё стоим
-            (StationaryResult(isMoving = false, Some(state.startTime)), Some(state))
-          } else {
-            // Сдвинулись — обновляем anchor
-            val newState = ParkingState(current.latitude, current.longitude, current.deviceTime)
-            (StationaryResult(isMoving = false, Some(newState.startTime)), Some(newState))
-          }
-        case None =>
-          // Начинаем стоянку
-          val newState = ParkingState(current.latitude, current.longitude, current.deviceTime)
-          (StationaryResult(isMoving = false, Some(newState.startTime)), Some(newState))
-      }
-    } else {
-      // Едем
-      (StationaryResult(isMoving = true, None), None)
-    }
-  }
-  
-  case class ParkingState(
-    anchorLat: Double,
-    anchorLon: Double,
-    startTime: Instant
-  )
+| errorType | Описание | Типичная причина |
+|-----------|----------|------------------|
+| `InvalidChecksum` | CRC не совпадает | Битый пакет, плохой канал |
+| `InvalidCodec` | Неизвестный codec ID | Новая прошивка трекера |
+| `ParseError` | Общая ошибка парсинга | Неожиданный формат |
+| `InsufficientData` | Недостаточно байт | Обрыв TCP, фрагментация |
+| `InvalidImei` | IMEI не проходит проверку | Повреждённый IMEI |
+| `UnknownDevice` | IMEI не в Redis | Незарегистрированный трекер |
+| `UnsupportedProtocol` | Протокол не поддерживается | Неизвестный трекер |
+| `ProtocolDetectionFailed` | Не определён протокол | multi-protocol порт |
+
+### GpsParseErrorEvent
+
+```json
+{
+  "imei": "860719020025346",
+  "protocol": "teltonika",
+  "errorType": "InvalidChecksum",
+  "errorMessage": "CRC mismatch: expected 0xA3F1, got 0xB2E0",
+  "rawPacketHex": "000000000000004308...",
+  "rawPacketSize": 67,
+  "remoteAddress": "192.168.1.100:54321",
+  "instanceId": "cm-01",
+  "timestamp": "2026-06-02T10:30:00Z"
 }
 ```
 
@@ -700,482 +643,76 @@ object StationaryFilter {
 
 ### Единая структура: `device:{imei}` (HASH)
 
-Все данные об устройстве хранятся в **одном HASH ключе**, что минимизирует количество запросов к Redis.
+Все данные об устройстве хранятся в **одном HASH ключе** — context + position + connection за **один HGETALL**.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    REDIS: device:{imei} (HASH)                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ═══════════════════════════════════════════════════════════════════    │
-│  CONTEXT FIELDS (записывает Device Manager)                             │
-│  ═══════════════════════════════════════════════════════════════════    │
-│                                                                         │
-│  vehicleId        = "12345"          # Long, ID в PostgreSQL            │
-│  organizationId   = "100"            # Long, ID организации             │
-│  name             = "Газель АА123"   # Название ТС                      │
-│  speedLimit       = "90"             # Int или "" (нет лимита)          │
-│  hasGeozones      = "true"           # Boolean string                   │
-│  hasSpeedRules    = "false"          # Boolean string                   │
-│  fuelTankVolume   = "70"             # Double или ""                    │
-│  sensorConfig     = "{...}"          # JSON string                      │
-│                                                                         │
-│  ═══════════════════════════════════════════════════════════════════    │
-│  POSITION FIELDS (записывает Connection Manager)                        │
-│  ═══════════════════════════════════════════════════════════════════    │
-│                                                                         │
-│  lat              = "55.751244"      # Double                           │
-│  lon              = "37.618423"      # Double                           │
-│  speed            = "45"             # Int, км/ч                        │
-│  course           = "180"            # Int, 0-359                       │
-│  altitude         = "156"            # Int, метры                       │
-│  satellites       = "12"             # Int                              │
-│  time             = "2026-02-04T12:30:00Z"  # ISO8601 Instant           │
-│  isMoving         = "true"           # Boolean string                   │
-│  sensors          = '{"fuel":45.5,"ignition":true}'  # JSON             │
-│                                                                         │
-│  ═══════════════════════════════════════════════════════════════════    │
-│  CONNECTION FIELDS (записывает Connection Manager)                      │
-│  ═══════════════════════════════════════════════════════════════════    │
-│                                                                         │
-│  instanceId       = "cm-teltonika-1" # ID инстанса CM                   │
-│  protocol         = "teltonika"      # Протокол                         │
-│  connectedAt      = "2026-02-04T12:00:00Z"  # Время подключения         │
-│  lastActivity     = "2026-02-04T12:30:00Z"  # Последняя активность      │
-│  remoteAddress    = "1.2.3.4:54321"  # IP:port трекера                  │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+erDiagram
+    DEVICE_HASH {
+        string vehicleId "12345 (Device Manager)"
+        string organizationId "100 (Device Manager)"
+        string name "Газель АА123 (Device Manager)"
+        string speedLimit "90 (Device Manager)"
+        string hasGeozones "true (Device Manager)"
+        string hasSpeedRules "false (Device Manager)"
+        string hasRetranslation "true (Integration Svc)"
+        string retranslationTargets "wialon-0,webhook-1"
+        string lat "55.751244 (CM)"
+        string lon "37.618423 (CM)"
+        string speed "45 (CM)"
+        string course "180 (CM)"
+        string time "2026-06-02T12:30:00Z (CM)"
+        string isMoving "true (CM)"
+        string sensors "JSON (CM)"
+        string instanceId "cm-teltonika-1 (CM)"
+        string protocol "teltonika (CM)"
+        string connectedAt "ISO8601 (CM)"
+        string lastActivity "ISO8601 (CM)"
+        string remoteAddress "1.2.3.4:54321 (CM)"
+    }
 ```
 
-### Операции Redis
-
-```scala
-// ═══════════════════════════════════════════════════════════════════════
-// DEVICE MANAGER (при создании/обновлении устройства)
-// ═══════════════════════════════════════════════════════════════════════
-
-// Создание устройства
-HSET device:860719020025346
-  vehicleId "12345"
-  organizationId "100"
-  name "Газель АА123"
-  speedLimit "90"
-  hasGeozones "false"
-  hasSpeedRules "false"
-
-// Добавили геозону для этого ТС
-HSET device:860719020025346 hasGeozones "true"
-
-// Удаление устройства
-DEL device:860719020025346
-
-// ═══════════════════════════════════════════════════════════════════════
-// CONNECTION MANAGER
-// ═══════════════════════════════════════════════════════════════════════
-
-// 1. При CONNECT (IMEI пакет) — проверяем существование
-HGETALL device:860719020025346
-// → Если нет vehicleId → трекер неизвестен → NACK + close
-// → Если есть → ACK + записываем connection info:
-
-HMSET device:860719020025346
-  instanceId "cm-teltonika-1"
-  protocol "teltonika"
-  connectedAt "2026-02-04T12:00:00Z"
-  lastActivity "2026-02-04T12:00:00Z"
-  remoteAddress "1.2.3.4:54321"
-
-// 2. При DATA пакете (каждый раз — без кеширования!)
-HGETALL device:860719020025346
-// → Получаем ВСЁ: context + prev position за 1 запрос
-// → Гарантирует актуальность флагов (hasGeozones и т.д.)
-
-// 3. После обработки — обновляем только position поля
-HMSET device:860719020025346
-  lat "55.751244"
-  lon "37.618423"
-  speed "45"
-  course "180"
-  time "2026-02-04T12:30:15Z"
-  isMoving "true"
-  sensors '{"fuel":45.5,"ignition":true}'
-  lastActivity "2026-02-04T12:30:15Z"
-
-// 4. При DISCONNECT — очищаем connection поля
-HDEL device:860719020025346 instanceId connectedAt remoteAddress
-```
-
-### Синхронизация Redis с PostgreSQL (Device Manager)
-
-Device Manager запускает **ежедневный sync job** для гарантии консистентности:
+### Операции CM с Redis
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    DEVICE MANAGER: Daily Sync Job                        │
-│                    (запускается раз в сутки, ~03:00)                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  1. SCAN Redis: получить все ключи device:*                             │
-│     SCAN 0 MATCH device:* COUNT 1000                                    │
-│                                                                         │
-│  2. Для каждого ключа:                                                  │
-│     - Извлечь IMEI из ключа                                             │
-│     - Проверить существование в PostgreSQL                              │
-│                                                                         │
-│  3. Если устройство УДАЛЕНО из БД:                                      │
-│     DEL device:{imei}                                                   │
-│     → Очистка orphan ключей                                             │
-│                                                                         │
-│  4. Если устройство ЕСТЬ в БД:                                          │
-│     - Сравнить context поля (vehicleId, orgId, speedLimit, flags)       │
-│     - Если расхождение → HMSET актуальными данными из БД                │
-│     → Исправление drift                                                 │
-│                                                                         │
-│  5. Проверить устройства в БД без ключа в Redis:                        │
-│     - SELECT * FROM devices WHERE NOT EXISTS in Redis                   │
-│     - Создать HASH с context полями                                     │
-│     → Восстановление пропущенных                                        │
-│                                                                         │
-│  Результат:                                                             │
-│  - Redis = source of truth для real-time данных                         │
-│  - PostgreSQL = source of truth для конфигурации                        │
-│  - Sync job гарантирует eventual consistency                            │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### TTL стратегия
-
-| Ключ | TTL | Причина |
-|------|-----|---------|
-| `device:{imei}` | **Нет** | Master data, управляется Device Manager |
-| Position поля | **Нет** | Обновляются при каждом пакете, `lastActivity` показывает актуальность |
-| Connection поля | **Нет** | Очищаются при disconnect, проверяются по `lastActivity` |
-
-**Определение offline на фронтенде:**
-```javascript
-const isOnline = device.lastActivity && 
-  (Date.now() - new Date(device.lastActivity).getTime()) < 5 * 60 * 1000;
-```
-
-### Scala структуры
-
-```scala
-/**
- * Полные данные устройства из Redis HASH
- * Ключ: device:{imei}
- */
-case class DeviceData(
-  // === CONTEXT (Device Manager) ===
-  vehicleId: Long,
-  organizationId: Long,
-  name: String,
-  speedLimit: Option[Int],
-  hasGeozones: Boolean,
-  hasSpeedRules: Boolean,
-  hasRetranslation: Boolean,                    // Integration Service записывает в Redis
-  retranslationTargets: Option[List[String]],   // ["wialon-0", "webhook-1"] — цели ретрансляции
-  fuelTankVolume: Option[Double],
-  sensorConfig: Option[SensorConfig],
-  
-  // === POSITION (Connection Manager) ===
-  lat: Option[Double],
-  lon: Option[Double],
-  speed: Option[Int],
-  course: Option[Int],
-  altitude: Option[Int],
-  satellites: Option[Int],
-  time: Option[Instant],
-  isMoving: Option[Boolean],
-  sensors: Option[SensorData],
-  
-  // === CONNECTION (Connection Manager) ===
-  instanceId: Option[String],
-  protocol: Option[String],
-  connectedAt: Option[Instant],
-  lastActivity: Option[Instant],
-  remoteAddress: Option[String]
-)
-
-object DeviceData:
-  /**
-   * Парсинг из Redis HASH (Map[String, String])
-   */
-  def fromRedisHash(hash: Map[String, String]): Option[DeviceData] =
-    for
-      vehicleId <- hash.get("vehicleId").flatMap(_.toLongOption)
-      orgId     <- hash.get("organizationId").flatMap(_.toLongOption)
-    yield DeviceData(
-      vehicleId = vehicleId,
-      organizationId = orgId,
-      name = hash.getOrElse("name", ""),
-      speedLimit = hash.get("speedLimit").filter(_.nonEmpty).flatMap(_.toIntOption),
-      hasGeozones = hash.get("hasGeozones").contains("true"),
-      hasSpeedRules = hash.get("hasSpeedRules").contains("true"),
-      hasRetranslation = hash.get("hasRetranslation").contains("true"),
-      retranslationTargets = hash.get("retranslationTargets")
-        .filter(_.nonEmpty)
-        .map(_.split(",").toList),
-      fuelTankVolume = hash.get("fuelTankVolume").flatMap(_.toDoubleOption),
-      sensorConfig = hash.get("sensorConfig").flatMap(_.fromJson[SensorConfig].toOption),
-      
-      lat = hash.get("lat").flatMap(_.toDoubleOption),
-      lon = hash.get("lon").flatMap(_.toDoubleOption),
-      speed = hash.get("speed").flatMap(_.toIntOption),
-      course = hash.get("course").flatMap(_.toIntOption),
-      altitude = hash.get("altitude").flatMap(_.toIntOption),
-      satellites = hash.get("satellites").flatMap(_.toIntOption),
-      time = hash.get("time").flatMap(s => Try(Instant.parse(s)).toOption),
-      isMoving = hash.get("isMoving").map(_ == "true"),
-      sensors = hash.get("sensors").flatMap(_.fromJson[SensorData].toOption),
-      
-      instanceId = hash.get("instanceId").filter(_.nonEmpty),
-      protocol = hash.get("protocol"),
-      connectedAt = hash.get("connectedAt").flatMap(s => Try(Instant.parse(s)).toOption),
-      lastActivity = hash.get("lastActivity").flatMap(s => Try(Instant.parse(s)).toOption),
-      remoteAddress = hash.get("remoteAddress")
-    )
-  
-  /**
-   * Position поля для HMSET после обработки пакета
-   */
-  def positionToHash(point: GpsPoint): Map[String, String] =
-    Map(
-      "lat" -> point.latitude.toString,
-      "lon" -> point.longitude.toString,
-      "speed" -> point.speed.toString,
-      "course" -> point.course.toString,
-      "time" -> point.deviceTime.toString,
-      "isMoving" -> point.isMoving.toString,
-      "lastActivity" -> Instant.now.toString
-    ) ++ point.altitude.map(a => "altitude" -> a.toString)
-      ++ point.satellites.map(s => "satellites" -> s.toString)
-      ++ Some("sensors" -> point.sensors.toJson)
-```
-
----
-
-## Kafka интеграция
-
-### Топики
-
-| Топик | Партиции | Retention | Условие публикации | Роль CM |
-|-------|----------|-----------|-------------------|---------|
-| `gps-events` | 12 | 7 дней | **ВСЕ** валидные точки | **Producer** |
-| `gps-events-rules` | 6 | 1 день | `hasGeozones=true` OR `hasSpeedRules=true` | **Producer** |
-| `gps-events-retranslation` | 6 | 1 день | `hasRetranslation=true` | **Producer** |
-| `device-status` | 3 | 30 дней | Connect/Disconnect | **Producer** |
-| `device-commands` | 6 | 7 дней | — | **Consumer** (Static Partition Assignment) |
-| `command-audit` | 3 | 90 дней | Результат выполнения команды | **Producer** |
-
-### Логика публикации
-
-```scala
-// После валидации и обновления Redis
-def publishToKafka(point: GpsPoint): Task[Unit] =
-  for
-    // 1. ВСЕГДА публикуем в основной топик
-    _ <- kafkaProducer.publish("gps-events", point.vehicleId.toString, point.toJson)
-    
-    // 2. Если есть правила — дублируем в топик для проверок
-    _ <- ZIO.when(point.hasGeozones || point.hasSpeedRules)(
-           kafkaProducer.publish("gps-events-rules", point.vehicleId.toString, point.toJson)
-         )
-    
-    // 3. Если есть ретрансляция — в топик для Integration Service
-    //    retranslationTargets уже встроены в GpsPoint, consumer не делает lookup в БД
-    _ <- ZIO.when(point.hasRetranslation)(
-           kafkaProducer.publish("gps-events-retranslation", point.vehicleId.toString, point.toJson)
-         )
-  yield ()
-```
-
-### Формат сообщений
-
-```scala
-/**
- * GPS точка для Kafka (обогащённая данными из DeviceData)
- */
-case class GpsPoint(
-  // Идентификация
-  vehicleId: Long,
-  organizationId: Long,
-  imei: String,
-  
-  // Координаты
-  latitude: Double,
-  longitude: Double,
-  altitude: Option[Int],
-  speed: Int,
-  course: Int,
-  satellites: Option[Int],
-  
-  // Время
-  deviceTime: Instant,
-  serverTime: Instant,
-  
-  // Флаги из контекста (для downstream сервисов)
-  speedLimit: Option[Int],                     // Geozones Service проверит превышение
-  hasGeozones: Boolean,                        // Маркер для фильтрации → gps-events-rules
-  hasSpeedRules: Boolean,                      // Маркер для фильтрации → gps-events-rules
-  hasRetranslation: Boolean,                   // Маркер для фильтрации → gps-events-retranslation
-  retranslationTargets: Option[List[String]],  // ["wialon-0", "webhook-1"] — цели без lookup в БД
-  
-  // Статус
-  isMoving: Boolean,
-  isValid: Boolean,
-  validationError: Option[String],
-  
-  // Датчики
-  sensors: SensorData,
-  
-  // Метаданные
-  protocol: String,
-  instanceId: String
-)
-
-// Partitioning key: vehicleId.toString
-// Гарантирует ordering всех точек одной машины
-
-/**
- * Статус устройства (online/offline)
- */
-case class DeviceStatusMessage(
-  vehicleId: Long,
-  imei: String,
-  status: String,         // "online" | "offline"
-  timestamp: Instant,
-  instanceId: String,
-  protocol: String,
-  connectionDuration: Option[Long],  // секунд (для offline)
-  disconnectReason: Option[String]   // "timeout", "error", "normal"
-)
-```
-
-### Анализ трафика
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Предположение: 30% машин имеют геозоны/правила, 10% ретрансляцию       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  10,000 точек/сек:                                                      │
-│  ├─ gps-events:              10,000 точек/сек (100%)                    │
-│  ├─ gps-events-rules:         3,000 точек/сек (~30%)                    │
-│  └─ gps-events-retranslation: 1,000 точек/сек (~10%)                    │
-│                                                                         │
-│  Итого: 1.4x трафик (приемлемый overhead за отсутствие DB lookup)        │
-│  ✅ Integration Service не ходит в PostgreSQL на каждое сообщение       │
-│                                                                         │
-│  При 200 байт/точка (+50 байт retranslationTargets):                    │
-│  ├─ gps-events:              ~2 MB/sec → ~170 GB/day                    │
-│  ├─ gps-events-rules:        ~0.6 MB/sec → ~50 GB/day                   │
-│  └─ gps-events-retranslation: ~0.25 MB/sec → ~20 GB/day                 │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Producer конфигурация
-
-```scala
-val producerSettings = ProducerSettings(List("kafka:9092"))
-  .withClientId("connection-manager")
-  .withProperty("acks", "1")              // Баланс надёжности и скорости
-  .withProperty("batch.size", "16384")    // 16KB батчи
-  .withProperty("linger.ms", "5")         // Ждём 5мс для батчинга
-  .withProperty("compression.type", "lz4") // Сжатие
-  .withProperty("retries", "3")
+1. CONNECT (IMEI пакет):    HGETALL device:{imei} → DeviceData
+                              → HMSET instanceId, protocol, connectedAt, remoteAddress
+2. DATA пакет (каждый раз): HGETALL device:{imei} → fresh context + prev position
+                              → HMSET lat, lon, speed, course, time, isMoving, sensors, lastActivity
+3. DISCONNECT:              HDEL device:{imei} instanceId connectedAt remoteAddress
+4. Pending commands:        ZADD pending_commands:{imei} (при offline)
+                              ZRANGEBYSCORE pending_commands:{imei} (при reconnect)
 ```
 
 ---
 
 ## API endpoints
 
-### Admin API (порт 8090)
+### Admin/Management API (порт 10090)
 
-```yaml
-openapi: 3.0.0
-info:
-  title: Connection Manager Admin API
-  version: 1.0.0
+20+ HTTP endpoints для управления и мониторинга:
 
-paths:
-  /health:
-    get:
-      summary: Health check
-      responses:
-        200:
-          description: Service is healthy
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status: { type: string, example: "healthy" }
-                  uptime: { type: integer, example: 3600 }
-                  connections: { type: integer, example: 1500 }
-
-  /metrics:
-    get:
-      summary: Prometheus metrics
-      responses:
-        200:
-          description: Prometheus format metrics
-          content:
-            text/plain:
-              example: |
-                cm_connections_total{protocol="teltonika"} 1234
-                cm_points_received_total 5678900
-                cm_parse_errors_total{protocol="wialon"} 12
-
-  /admin/connections:
-    get:
-      summary: List active connections
-      parameters:
-        - name: protocol
-          in: query
-          schema: { type: string }
-        - name: limit
-          in: query
-          schema: { type: integer, default: 100 }
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    imei: { type: string }
-                    vehicleId: { type: integer }
-                    protocol: { type: string }
-                    connectedAt: { type: string, format: date-time }
-                    lastActivity: { type: string, format: date-time }
-                    pointsReceived: { type: integer }
-
-  /admin/connections/{imei}:
-    get:
-      summary: Get connection details
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ConnectionDetails'
-    delete:
-      summary: Force disconnect tracker
-      responses:
-        204:
-          description: Disconnected
-
-  /admin/reload-config:
-    post:
-      summary: Reload configuration without restart
-      responses:
-        200:
-          description: Config reloaded
-```
+| Метод | Путь | Описание |
+|-------|------|----------|
+| GET | `/health` | Health check (K8s liveness probe) |
+| GET | `/ready` | Readiness (Redis + Kafka connected) |
+| GET | `/metrics` | Prometheus метрики |
+| GET | `/admin/connections` | Список активных соединений |
+| GET | `/admin/connections/{imei}` | Детали соединения |
+| DELETE | `/admin/connections/{imei}` | Force disconnect |
+| GET | `/admin/protocols` | Список активных протоколов |
+| GET | `/admin/protocols/{name}/stats` | Статистика протокола |
+| POST | `/admin/reload-config` | Перезагрузка конфигурации |
+| GET | `/admin/commands/pending` | Ожидающие команды |
+| GET | `/admin/commands/pending/{imei}` | Pending по IMEI |
+| DELETE | `/admin/commands/pending/{commandId}` | Отменить команду |
+| GET | `/admin/parse-errors` | Последние ошибки парсинга |
+| GET | `/admin/parse-errors/stats` | Статистика ошибок по протоколам |
+| GET | `/admin/kafka/lag` | Consumer lag по партициям |
+| GET | `/admin/redis/stats` | Статистика Redis операций |
+| GET | `/admin/filters/dead-reckoning/stats` | Статистика Dead Reckoning |
+| PUT | `/admin/filters/dead-reckoning/config` | Обновить конфиг фильтра |
+| GET | `/admin/instance` | Информация об инстансе |
+| POST | `/admin/gc` | Force GC (для отладки) |
 
 ---
 
@@ -1227,9 +764,10 @@ flowchart TB
 ### Session Affinity
 
 ```yaml
-# HAProxy config
+# HAProxy config (18 протоколов)
 frontend tcp_trackers
-    bind *:5001-5004
+    bind *:5001-5015  # 15 протоколов
+    bind *:5100       # Multi-protocol
     mode tcp
     default_backend cm_servers
 
@@ -1237,12 +775,12 @@ backend cm_servers
     mode tcp
     balance source  # Sticky по IP трекера
     option tcp-check
-    server cm1 cm-1:5001 check
-    server cm2 cm-2:5001 check
-    server cm3 cm-3:5001 check
+    server cm1 cm-1:5001-5015 check
+    server cm2 cm-2:5001-5015 check
+    server cm3 cm-3:5001-5015 check
 ```
 
-**Важно:** Трекер должен переподключаться к тому же инстансу (session affinity), но если инстанс упал — Redis registry позволяет другому инстансу принять соединение.
+**Важно:** Трекер переподключается к тому же инстансу (session affinity), но если инстанс упал — Redis registry позволяет другому инстансу принять соединение. Все 18 протоколов проксируются через один L4 балансировщик.
 
 ---
 
@@ -1262,9 +800,12 @@ cm_points_received_total{protocol="teltonika"} 12345678
 cm_points_per_second{protocol="teltonika"} 450
 cm_points_invalid_total{reason="teleport"} 123
 
-# Парсинг
+# Парсинг (18 протоколов)
 cm_parse_duration_seconds_bucket{protocol="teltonika",le="0.001"} 9999
 cm_parse_errors_total{protocol="wialon",error="checksum"} 45
+
+# Ошибки парсинга → gps-parse-errors (NEW v4.0)
+cm_parse_errors_published_total{protocol="concox",errorType="CrcMismatch"} 12
 
 # Kafka
 cm_kafka_publish_duration_seconds_bucket{le="0.01"} 9990
@@ -1285,11 +826,13 @@ cm_redis_latency_seconds_bucket{operation="setPosition",le="0.001"} 9999
 │       [4,523]         │      [8,456]          │      [12]           │
 ├───────────────────────┴───────────────────────┴─────────────────────┤
 │                                                                     │
-│  Connections by Protocol (graph)                                    │
+│  Connections by Protocol — TOP-5 (graph)                            │
 │  ████████████████████ Teltonika (3,200)                            │
 │  ██████████ Wialon (1,100)                                         │
-│  ████ Ruptela (200)                                                │
-│  █ NavTelecom (23)                                                 │
+│  ████ Concox (400)                                                 │
+│  ███ Ruptela (200)                                                 │
+│  ██ Galileosky (150)                                               │
+│  █ NavTelecom + 12 остальных (373)                                 │
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
@@ -1343,7 +886,7 @@ groups:
 
 ## Конфигурация
 
-### application.conf
+### application.conf (актуальный)
 
 ```hocon
 connection-manager {
@@ -1351,55 +894,35 @@ connection-manager {
   instance-id = ${?CM_INSTANCE_ID}
   
   tcp {
-    # Порты протоколов
-    teltonika.port = 5001
-    wialon.port = 5002
-    ruptela.port = 5003
-    navtelecom.port = 5004
+    # 16 портов протоколов + 1 multi-protocol
+    teltonika      { port = 5001, enabled = true }
+    wialon         { port = 5002, enabled = true }
+    ruptela        { port = 5003, enabled = true }
+    navtelecom     { port = 5004, enabled = true }
+    gosafe         { port = 5005, enabled = true }
+    skysim         { port = 5006, enabled = true }
+    autophone-mayak { port = 5007, enabled = true }
+    dtm            { port = 5008, enabled = true }
+    galileosky     { port = 5009, enabled = true }
+    concox         { port = 5010, enabled = true }
+    tk102          { port = 5011, enabled = true }
+    arnavi         { port = 5012, enabled = true }
+    adm            { port = 5013, enabled = true }
+    gtlt           { port = 5014, enabled = true }
+    micro-mayak    { port = 5015, enabled = true }
+    multi-protocol { port = 5100, enabled = true }
     
     # Netty настройки
     backlog = 1024
     receive-buffer-size = 65536
-    send-buffer-size = 65536
     keep-alive = true
     tcp-no-delay = true
-    
-    # Таймауты
-    connection-timeout = 30s
-    idle-timeout = 300s  # Отключаем неактивных
+    idle-timeout = 300s
   }
   
   admin {
-    port = 8090
+    port = 10090
     enabled = true
-  }
-  
-  validation {
-    dead-reckoning {
-      enabled = true
-      max-speed-kmh = 300
-      max-teleport-meters = 5000
-    }
-    
-    stationary {
-      enabled = true
-      speed-threshold-kmh = 3
-      distance-threshold-meters = 50
-    }
-  }
-  
-  redis {
-    host = ${REDIS_HOST}
-    port = 6379
-    database = 0
-    
-    position-ttl = 1h
-    vehicle-mapping-ttl = 1h
-    
-    pool {
-      max-total = 50
-      max-idle = 10
-    }
   }
   
   kafka {
@@ -1407,9 +930,15 @@ connection-manager {
     
     topics {
       gps-events = "gps-events"
-      gps-events-moving = "gps-events-moving"
+      gps-events-rules = "gps-events-rules"
+      gps-events-retranslation = "gps-events-retranslation"
+      gps-parse-errors = "gps-parse-errors"
       device-status = "device-status"
-      command-responses = "command-responses"
+      device-commands = "device-commands"
+      device-events = "device-events"
+      command-audit = "command-audit"
+      unknown-devices = "unknown-devices"
+      unknown-gps-events = "unknown-gps-events"
     }
     
     producer {
@@ -1419,25 +948,26 @@ connection-manager {
       compression = "lz4"
     }
   }
+  
+  redis {
+    host = ${REDIS_HOST}
+    port = 6379
+    database = 0
+  }
+  
+  validation {
+    dead-reckoning {
+      enabled = true
+      max-speed-kmh = 300
+      max-teleport-meters = 5000
+    }
+    stationary {
+      enabled = true
+      speed-threshold-kmh = 3
+      distance-threshold-meters = 50
+    }
+  }
 }
-```
-
-### Environment variables
-
-```bash
-# Обязательные
-REDIS_HOST=redis
-KAFKA_BROKERS=kafka:9092
-
-# Опциональные
-CM_INSTANCE_ID=cm-instance-1
-CM_ADMIN_PORT=8090
-CM_TELTONIKA_PORT=5001
-CM_WIALON_PORT=5002
-
-# Logging
-LOG_LEVEL=INFO
-LOG_FORMAT=json
 ```
 
 ### Docker Compose
@@ -1447,11 +977,9 @@ services:
   connection-manager:
     build: ./services/connection-manager
     ports:
-      - "5001:5001"  # Teltonika
-      - "5002:5002"  # Wialon
-      - "5003:5003"  # Ruptela
-      - "5004:5004"  # NavTelecom
-      - "8090:8090"  # Admin API
+      - "5001-5015:5001-5015"  # Все протоколы
+      - "5100:5100"            # Multi-protocol
+      - "10090:10090"          # Admin API
     environment:
       - REDIS_HOST=redis
       - KAFKA_BROKERS=kafka:9092
@@ -1459,16 +987,8 @@ services:
     depends_on:
       - redis
       - kafka
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-        reservations:
-          cpus: '1'
-          memory: 1G
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:10090/health"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -1476,568 +996,154 @@ services:
 
 ---
 
+## Структура файлов
+
+```
+services/connection-manager/
+├── docs/
+│   ├── README.md           # Точка входа: запуск, порты, окружение
+│   ├── ARCHITECTURE.md     # Внутренняя архитектура, 10+ Mermaid диаграмм
+│   ├── KAFKA.md            # 10 топиков: produce/consume маршруты
+│   ├── PROTOCOLS.md        # 18 протоколов: формат пакетов, CRC, ACK
+│   ├── DATA_MODEL.md       # Redis ключи, GpsPoint, GpsParseErrorEvent
+│   ├── DECISIONS.md        # ADR 001-011: все архитектурные решения
+│   ├── RUNBOOK.md          # Запуск, дебаг, типичные ошибки
+│   └── INDEX.md            # Содержание документации
+└── src/main/scala/com/wayrecall/tracker/
+    ├── Main.scala                          # ZIOAppDefault entry point
+    ├── config/
+    │   └── AppConfig.scala                 # HOCON конфиг + KafkaTopicsConfig
+    ├── domain/
+    │   ├── GpsPoint.scala                  # GpsRawPoint, GpsPoint, GpsParseErrorEvent
+    │   ├── Command.scala                   # 10 типов команд + CommandDelivery + PendingCommand
+    │   └── Protocol.scala                  # enum Protocol (18 вариантов)
+    ├── command/                            # 🆕 v4.0 — Система команд
+    │   ├── CommandEncoder.scala            # trait + factory forProtocol()
+    │   ├── TeltonikaEncoder.scala          # Codec 12 + CRC-16-IBM
+    │   ├── NavTelecomEncoder.scala         # NTCB FLEX text
+    │   ├── DtmEncoder.scala               # Binary IOSwitch
+    │   ├── RuptelaEncoder.scala            # Binary 0x65/0x66/0x67
+    │   └── WialonEncoder.scala             # Text #M#{text}\r\n
+    ├── protocol/                           # 18 парсеров
+    │   ├── ProtocolParser.scala            # trait + canParse + generateAck + encodeCommand
+    │   ├── MultiProtocolParser.scala       # Автодетекция: quickDetect → fullDetect
+    │   ├── TeltonikaParser.scala           # Codec 8/8E, порт 5001
+    │   ├── WialonParser.scala              # IPS v2.0, порт 5002
+    │   ├── RuptelaParser.scala             # Binary, порт 5003
+    │   ├── NavTelecomParser.scala          # FLEX, порт 5004
+    │   ├── GosafeParser.scala              # ASCII, порт 5005
+    │   ├── SkysimParser.scala              # AT-команды, порт 5006
+    │   ├── AutophoneMayakParser.scala      # Binary, порт 5007
+    │   ├── DtmParser.scala                 # Binary, порт 5008
+    │   ├── GalileoskyParser.scala          # Binary tags, порт 5009
+    │   ├── ConcoxParser.scala              # Binary, порт 5010
+    │   ├── Tk102Parser.scala               # ASCII SMS-like, порт 5011
+    │   ├── ArnaviParser.scala              # Binary, порт 5012
+    │   ├── AdmParser.scala                 # Binary, порт 5013
+    │   ├── GtltParser.scala                # ASCII, порт 5014
+    │   └── MicroMayakParser.scala          # Binary micro, порт 5015
+    ├── filter/
+    │   ├── DeadReckoningFilter.scala       # Фильтр телепортаций (>300 км/ч)
+    │   └── StationaryFilter.scala          # Фильтр стоянок (<3 км/ч)
+    ├── network/
+    │   ├── TcpServer.scala                 # Netty: 16 портов + multi
+    │   ├── ConnectionHandler.scala         # Обработка соединений, foldZIO → gps-parse-errors
+    │   ├── CommandService.scala            # Получение/отправка команд
+    │   └── GpsProcessingService.scala      # Pipeline: parse → validate → enrich → Kafka
+    ├── service/
+    │   └── DeviceContextService.scala      # Redis context: org, vehicle, capabilities
+    ├── storage/
+    │   ├── RedisClient.scala               # device:{imei} HASH операции
+    │   └── KafkaProducer.scala             # 10 топиков: publish + publishParseError
+    └── util/
+        ├── CrcCalculator.scala             # CRC-16, CRC-32 для разных протоколов
+        └── GeoMath.scala                   # Haversine, bearing, distance
+```
+
+---
+
 ## 📚 Связанные документы
 
-- [ARCHITECTURE_BLOCK1.md](./ARCHITECTURE_BLOCK1.md) — Обзор Block 1
-- [DATA_STORES.md](./DATA_STORES.md) — Схемы хранилищ
-- [HISTORY_WRITER.md](./services/HISTORY_WRITER.md) — Следующий сервис
+### Документация CM (services/connection-manager/docs/)
+
+| Документ | Содержание |
+|----------|------------|
+| [ARCHITECTURE.md](../../services/connection-manager/docs/ARCHITECTURE.md) | Внутренняя архитектура, 10+ Mermaid диаграмм |
+| [KAFKA.md](../../services/connection-manager/docs/KAFKA.md) | 10 Kafka топиков, маршруты, JSON примеры |
+| [PROTOCOLS.md](../../services/connection-manager/docs/PROTOCOLS.md) | 18 протоколов, binary format, CRC алгоритмы |
+| [DATA_MODEL.md](../../services/connection-manager/docs/DATA_MODEL.md) | Redis ключи, домен модели, GpsParseErrorEvent |
+| [DECISIONS.md](../../services/connection-manager/docs/DECISIONS.md) | ADR 001-011, все архитектурные решения |
+
+### Системная документация
+
+| Документ | Содержание |
+|----------|------------|
+| [ARCHITECTURE_BLOCK1.md](../ARCHITECTURE_BLOCK1.md) | Обзор Block 1 — Data Collection |
+| [ARCHITECTURE.md](../ARCHITECTURE.md) | Общая архитектура (3 блока) |
+| [DATA_STORES.md](../DATA_STORES.md) | Схемы всех хранилищ |
+| [infra/kafka/TOPICS.md](../../infra/kafka/TOPICS.md) | 10 Kafka топиков, матрица сервисов |
+| [DEVICE_MANAGER.md](./DEVICE_MANAGER.md) | REST API устройств, отправка команд |
+| [HISTORY_WRITER.md](./HISTORY_WRITER.md) | Запись GPS в TimescaleDB |
 
 ---
 
-## 🤖 Промпт для AI-агента
+## ✅ РЕАЛИЗОВАНО: Типизированные ошибки парсинга (v4.0)
 
-<details>
-<summary><b>Развернуть полный промпт для реализации Connection Manager</b></summary>
+> Реализовано в `domain/GpsPoint.scala` — `ProtocolError` sealed trait + `GpsParseErrorEvent`
 
-```markdown
-# ЗАДАЧА: Реализовать Connection Manager для TrackerGPS
+Все 18 парсеров используют типизированные ошибки через `ZIO.fail(ProtocolError.*)`.
+При ошибке парсинга — событие публикуется в `gps-parse-errors` Kafka топик (см. раздел "Мониторинг ошибок парсинга").
 
-## КОНТЕКСТ
-Ты — senior Scala разработчик. Создай Connection Manager — сервис приёма GPS данных от трекеров для системы мониторинга транспорта TrackerGPS.
-
-## ТЕХНИЧЕСКИЙ СТЕК (ОБЯЗАТЕЛЬНО)
-- **Язык:** Scala 3.4.0
-- **Эффекты:** ZIO 2.0.20
-- **Сеть:** zio-http (для HTTP API), Netty 4 (для TCP)
-- **Kafka:** zio-kafka
-- **Redis:** zio-redis  
-- **Конфигурация:** zio-config + HOCON
-- **Метрики:** zio-metrics + Prometheus
-- **Логирование:** zio-logging + SLF4J
-- **Сборка:** SBT
-
-## АРХИТЕКТУРА СЕРВИСА
-
-### Основные компоненты:
-1. **TCP Server (Netty)** — слушает порты 5001-5004 для разных протоколов
-2. **Protocol Router** — определяет протокол по первым байтам
-3. **Protocol Parsers** — парсеры для Teltonika, Wialon IPS, Ruptela, NavTelecom
-4. **Validator** — проверка координат, IMEI, timestamp
-5. **Kafka Producer** — публикация в топик `gps-events`
-6. **Redis Client** — регистрация устройств, команды
-7. **HTTP API** — health, metrics, admin endpoints
-
-### Flow обработки:
-```
-TCP Connection → Read bytes → Detect protocol → Parse → Validate → Enrich → Kafka
-                                                                      ↓
-                                                              Redis (register device)
-```
-
-## ТРЕБОВАНИЯ К РЕАЛИЗАЦИИ
-
-### 1. TCP Server
-```scala
-// Конфигурация портов
-trait TcpServerConfig:
-  def ports: Map[Protocol, Int]  // Teltonika -> 5001, Wialon -> 5002, etc.
-  def maxConnections: Int        // 10000
-  def idleTimeout: Duration      // 5 minutes
-  def readBufferSize: Int        // 4096 bytes
-
-// Обработчик соединений
-trait ConnectionHandler:
-  def handle(channel: Channel): ZIO[Any, Throwable, Unit]
-```
-
-### 2. Protocol Parsers (trait + implementations)
-```scala
-trait ProtocolParser:
-  def protocol: Protocol
-  def canParse(bytes: Chunk[Byte]): Boolean  // Проверка magic bytes
-  def parse(bytes: Chunk[Byte]): IO[ParseError, List[GpsPoint]]
-
-// Каждый парсер должен:
-// - Извлекать IMEI устройства
-// - Парсить координаты (lat, lon)
-// - Парсить timestamp (Unix epoch)
-// - Извлекать скорость, курс, высоту
-// - Парсить I/O данные (ignition, fuel level, etc.)
-// - Формировать ACK ответ для трекера
-```
-
-### 3. Модели данных
-```scala
-case class GpsPoint(
-  deviceId: String,           // IMEI
-  timestamp: Instant,
-  latitude: Double,
-  longitude: Double,
-  altitude: Option[Int],
-  speed: Option[Int],         // км/ч
-  course: Option[Int],        // 0-359 градусов
-  satellites: Option[Int],
-  hdop: Option[Double],
-  ignition: Option[Boolean],
-  fuelLevel: Option[Double],
-  ioData: Map[String, String],
-  protocol: Protocol,
-  rawData: Option[Chunk[Byte]]
-)
-
-enum Protocol:
-  case Teltonika, WialonIPS, Ruptela, NavTelecom, Unknown
-```
-
-### 4. Валидация
-```scala
-object GpsValidator:
-  // Координаты в допустимом диапазоне
-  def validateCoordinates(lat: Double, lon: Double): Boolean =
-    lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
-  
-  // Timestamp не в будущем и не слишком старый
-  def validateTimestamp(ts: Instant): Boolean =
-    val now = Instant.now()
-    ts.isBefore(now.plusMinutes(5)) && ts.isAfter(now.minusDays(7))
-  
-  // IMEI валидный (15 цифр)
-  def validateImei(imei: String): Boolean =
-    imei.matches("^\\d{15}$")
-```
-
-### 5. Redis операции
-```scala
-trait DeviceRegistry:
-  // При получении данных — обновляем last_seen
-  def registerActivity(deviceId: String, protocol: Protocol): UIO[Unit]
-  
-  // Проверяем очередь команд для устройства
-  def getCommand(deviceId: String): UIO[Option[DeviceCommand]]
-  
-  // Подтверждаем выполнение команды
-  def ackCommand(deviceId: String, commandId: String): UIO[Unit]
-
-// Redis ключи:
-// device:{imei}:last_seen = timestamp
-// device:{imei}:protocol = "teltonika"
-// device:{imei}:commands = List[Command] (очередь)
-```
-
-### 6. Kafka Producer
-```scala
-trait GpsEventProducer:
-  def publish(points: List[GpsPoint]): Task[Unit]
-
-// Топик: gps-events (12 партиций)
-// Ключ: device_id (IMEI) — для ordering по устройству
-// Формат: JSON или Avro
-```
-
-### 7. HTTP API (zio-http)
-```scala
-// GET /health — liveness probe
-// GET /ready — readiness probe (Kafka + Redis connected)
-// GET /metrics — Prometheus метрики
-// GET /connections — список активных соединений
-// POST /disconnect/{imei} — отключить устройство
-```
-
-### 8. Метрики (Prometheus)
-```scala
-// Counters
-cm_connections_total{protocol="teltonika"}
-cm_points_received_total{protocol="teltonika"}
-cm_points_published_total
-cm_parse_errors_total{protocol="teltonika", error="invalid_checksum"}
-
-// Gauges
-cm_active_connections{protocol="teltonika"}
-
-// Histograms
-cm_parse_duration_seconds{protocol="teltonika"}
-cm_publish_duration_seconds
-```
-
-## СТРУКТУРА ПРОЕКТА
-```
-connection-manager/
-├── src/main/scala/
-│   └── trackergps/connectionmanager/
-│       ├── Main.scala              # Entry point
-│       ├── config/
-│       │   └── AppConfig.scala     # HOCON config
-│       ├── tcp/
-│       │   ├── TcpServer.scala     # Netty server
-│       │   └── ConnectionHandler.scala
-│       ├── protocol/
-│       │   ├── Protocol.scala      # Enum
-│       │   ├── ProtocolParser.scala # Trait
-│       │   ├── TeltonikaParser.scala
-│       │   ├── WialonIpsParser.scala
-│       │   ├── RuptelaParser.scala
-│       │   └── NavTelecomParser.scala
-│       ├── model/
-│       │   ├── GpsPoint.scala
-│       │   └── DeviceCommand.scala
-│       ├── validation/
-│       │   └── GpsValidator.scala
-│       ├── kafka/
-│       │   └── GpsEventProducer.scala
-│       ├── redis/
-│       │   └── DeviceRegistry.scala
-│       ├── http/
-│       │   └── AdminApi.scala
-│       └── metrics/
-│           └── Metrics.scala
-├── src/main/resources/
-│   └── application.conf
-├── src/test/scala/
-│   └── ... (unit tests)
-└── build.sbt
-```
-
-## ПРИМЕР КОДА (стиль)
-
-```scala
-// Main.scala
-object Main extends ZIOAppDefault:
-  
-  override def run: ZIO[Any, Any, Any] =
-    (for
-      config <- ZIO.service[AppConfig]
-      _      <- ZIO.logInfo(s"Starting Connection Manager on ports ${config.tcp.ports}")
-      
-      // Запускаем TCP серверы для каждого протокола
-      tcpFibers <- ZIO.foreach(config.tcp.ports.toList) { case (protocol, port) =>
-        TcpServer.start(port, protocol).fork
-      }
-      
-      // Запускаем HTTP API
-      httpFiber <- AdminApi.serve(config.http.port).fork
-      
-      // Ждём завершения
-      _ <- ZIO.never
-      
-    yield ())
-      .provide(
-        AppConfig.live,
-        TcpServer.live,
-        ProtocolRouter.live,
-        TeltonikaParser.live,
-        WialonIpsParser.live,
-        GpsEventProducer.live,
-        DeviceRegistry.live,
-        Metrics.live,
-        ZLayer.succeed(Scope.global)
-      )
-```
-
-## КРИТЕРИИ ПРИЁМКИ
-
-1. ✅ Сервис запускается и слушает TCP порты
-2. ✅ Парсит минимум 2 протокола (Teltonika + Wialon IPS)
-3. ✅ Публикует точки в Kafka
-4. ✅ Регистрирует устройства в Redis
-5. ✅ Отдаёт метрики в Prometheus формате
-6. ✅ Graceful shutdown
-7. ✅ Unit тесты для парсеров
-8. ✅ Docker-ready (Dockerfile)
-
-## ССЫЛКИ НА ДОКУМЕНТАЦИЮ ПРОТОКОЛОВ
-- Teltonika: https://wiki.teltonika-gps.com/view/Codec
-- Wialon IPS: https://extapi.wialon.com/hw/cfg/Wialon%20IPS_v2.0.pdf
-```
-
-</details>
-
----
-
-**Дата:** 12 февраля 2026  
-**Статус:** Документация обновлена ✅
-
----
-
-## Типизированные ошибки парсинга (ADT)
-
-### Проблема (текущий код)
-
-Все парсеры (Teltonika, Wialon, Ruptela, NavTelecom) используют `throw new Exception(...)` / `throw new RuntimeException(...)` — это нарушает FP-принципы и не даёт структурированной информации об ошибке.
-
-### Решение: sealed trait ParseError
-
-```scala
-/**
- * Иерархия ошибок парсинга GPS-пакетов
- * 
- * Каждая ошибка содержит:
- * - protocol: какой парсер вызвал ошибку
- * - message: человекочитаемое описание
- * - field: какое именно поле не удалось распарсить (если применимо)
- * - rawBytes: сырые данные для отладки (первые N байт)
- */
-sealed trait ParseError extends Throwable:
-  def protocol: String
-  def message: String
-
-object ParseError:
-  /** Недостаточно байт для чтения пакета */
-  case class InsufficientData(
-    protocol: String,
-    expected: Int,
-    actual: Int,
-    stage: String  // "imei", "header", "data", "crc"
-  ) extends ParseError:
-    def message = s"[$protocol] $stage: ожидал $expected байт, получил $actual"
-
-  /** Невалидный формат поля */
-  case class InvalidField(
-    protocol: String,
-    fieldName: String,
-    rawValue: String,
-    reason: String
-  ) extends ParseError:
-    def message = s"[$protocol] Невалидное поле '$fieldName': $rawValue ($reason)"
-
-  /** Невалидный IMEI */
-  case class InvalidImei(
-    protocol: String,
-    imei: String,
-    reason: String
-  ) extends ParseError:
-    def message = s"[$protocol] Невалидный IMEI: $imei ($reason)"
-
-  /** Ошибка контрольной суммы */
-  case class CrcMismatch(
-    protocol: String,
-    expected: Long,
-    actual: Long
-  ) extends ParseError:
-    def message = s"[$protocol] CRC не совпадает: ожидал=$expected, получил=$actual"
-
-  /** Неподдерживаемая версия кодека */
-  case class UnsupportedCodec(
-    protocol: String,
-    codecId: Int
-  ) extends ParseError:
-    def message = s"[$protocol] Неподдерживаемый кодек: 0x${codecId.toHexString}"
-
-  /** Несовпадение количества записей */
-  case class RecordCountMismatch(
-    protocol: String,
-    headerCount: Int,
-    trailerCount: Int
-  ) extends ParseError:
-    def message = s"[$protocol] Записи: заголовок=$headerCount, footer=$trailerCount"
-
-  /** Невалидная сигнатура пакета */
-  case class InvalidSignature(
-    protocol: String,
-    expected: String,
-    actual: String
-  ) extends ParseError:
-    def message = s"[$protocol] Невалидная сигнатура: ожидал=$expected, получил=$actual"
-
-  /** Неизвестный тип пакета */
-  case class UnknownPacketType(
-    protocol: String,
-    packetType: String
-  ) extends ParseError:
-    def message = s"[$protocol] Неизвестный тип пакета: $packetType"
-```
-
-### Миграция парсеров
-
-**До (throw):**
-```scala
-// ❌ TeltonikaParser.scala
-throw new Exception(s"Невалидный preamble: $preamble")
-throw new Exception(s"CRC не совпадает: calculated=$calc, received=$recv")
-```
-
-**После (ADT):**
-```scala
-// ✅ TeltonikaParser.scala
-ZIO.fail(ParseError.InvalidSignature("teltonika", "00000000", preamble.toString))
-ZIO.fail(ParseError.CrcMismatch("teltonika", calc, recv))
-```
-
-### Что это даёт
-
-- **Метрики:** можно считать ошибки по типам (`InvalidImei` vs `CrcMismatch`)
-- **Мониторинг:** алерт "много CRC ошибок от протокола X" = проблема с сетью
-- **Отладка:** в логах видно конкретную причину, а не generic Exception
-- **FP:** ошибки в сигнатурах типов, компилятор помогает обрабатывать все случаи
+8 типов ошибок: `InsufficientData`, `InvalidField`, `InvalidImei`, `CrcMismatch`, `UnsupportedCodec`, `RecordCountMismatch`, `InvalidSignature`, `UnknownPacketType`
 
 ---
 
 ## Post-MVP: GPS спуфинг-фильтр
 
-### Проблема
+> Статус: **В планах** (после MVP)
 
-В крупных городах России (особенно центр Москвы) системы РЭБ подавляют/подменяют GPS сигнал. Типичная аномалия: трекер едет по Тверской → внезапная точка в аэропорту Внуково (50 км). Это **не ошибка трекера** и **не телепортация** — это намеренное искажение координат служебными системами.
+В крупных городах России (центр Москвы) системы РЭБ подменяют GPS сигнал. Dead Reckoning отсекает аномальные точки, но не восстанавливает реальный маршрут.
 
-Dead Reckoning фильтр отсекает такую точку (>300 км/ч), но **не восстанавливает реальный маршрут**.
+**Концепция:** расширяющаяся окружность из последней валидной точки [A] с радиусом `R = V × 1.5 × ΔT`. Когда новая точка попадает в окружность — спуфинг закончился, точка [B] валидна. Между [A] и [B] — интерполяция через OSRM (map matching по OSM данным России).
 
-### Концепция: SpoofingFilter (расширяющаяся окружность)
-
-```
-             Время →
-     
-     ●───●───●───X · · · X · · · X───●───●───●
-     │ нормальные │  спуфинг-зона │ восстановление
-     │   точки    │  (Внуково)   │
-     │            │              │
-     │   [A]      │              │    [B]
-     │ last valid  │              │  first valid
-     
-     Алгоритм:
-     
-     1. Детектим аномалию: точка [X] далеко от [A] за слишком короткое время
-     2. Запоминаем контекст:
-        - последняя валидная точка [A] (из Redis)
-        - последняя известная скорость V (из Redis)
-        - время начала аномалии T0
-     3. Каждую следующую точку проверяем:
-        - ΔT = текущее_время - T0
-        - R = V × 1.5 × ΔT (окружность растёт со скоростью 1.5x)
-        - Если новая точка попадает в окружность с центром [A] и радиусом R → ВАЛИДНА [B]
-     4. При [B] — выходим из спуфинг-режима
-     5. Между [A] и [B] — можно аппроксимировать маршрут (интерполяция)
-```
-
-### Состояние фильтра (в Redis или Ref)
-
-```scala
-case class SpoofingContext(
-  lastValidPoint: GpsPoint,       // точка [A]
-  lastValidSpeed: Double,         // скорость в [A] (км/ч)
-  spoofingStartTime: Instant,     // когда началась аномалия
-  spoofedPoints: List[GpsPoint],  // накопленные аномальные точки
-  radiusGrowthFactor: Double = 1.5 // множитель роста окружности
-)
-```
-
-### Алгоритм проверки
-
-```scala
-def checkSpoofing(
-  newPoint: GpsPoint,
-  context: SpoofingContext
-): SpoofingResult =
-  val elapsed = Duration.between(context.spoofingStartTime, newPoint.deviceTime)
-  val elapsedHours = elapsed.toMillis / 3_600_000.0
-  
-  // Радиус окружности растёт из точки [A] со скоростью V × 1.5
-  val radiusKm = context.lastValidSpeed * context.radiusGrowthFactor * elapsedHours
-  
-  // Дистанция от [A] до новой точки
-  val distanceKm = GeoMath.distanceKm(
-    context.lastValidPoint.latitude, context.lastValidPoint.longitude,
-    newPoint.latitude, newPoint.longitude
-  )
-  
-  if distanceKm <= radiusKm then
-    SpoofingResult.RecoveredValid(newPoint)  // точка [B] — вернулись в нормальный режим
-  else
-    SpoofingResult.StillSpoofed(newPoint)    // всё ещё аномалия — копим контекст
-```
-
-### Готовые OSM-данные по дорогам
-
-Для более точного восстановления маршрута:
-
-- **OSRM** (Open Source Routing Machine) — map matching API (snap GPS точек к дорогам)
-- **Valhalla** — аналог OSRM (поддерживает map matching из коробки)
-- **pgRouting** — расширение PostGIS для маршрутизации в базе данных
-- **OpenStreetMap для России** — полный граф дорог, обновляется сообществом
-
-Для Post-MVP можно поднять OSRM контейнер с OSM-данными России и восстанавливать маршрут между [A] и [B] через map matching.
-
-### Интеграция в Pipeline
-
+**Интеграция в Pipeline:**
 ```
 parseData → deadReckoningFilter → [spoofingFilter] → stationaryFilter → Kafka
-                                       ↑
-                                  Post-MVP
-```
-
-### Конфигурация (DynamicConfigService)
-
-```
-spoofing_filter_enabled: true
-spoofing_radius_growth_factor: 1.5    # множитель скорости роста окружности
-spoofing_max_duration_minutes: 60     # макс. время аномалии (после — сброс)
-spoofing_min_distance_km: 5.0         # мин. расстояние для детекции (< 5 км не спуфинг)
+                                       ↑ Post-MVP
 ```
 
 ---
 
-## ⚠️ TODO: Доработки парсеров (MVP)
+## ✅ РЕШЕНО: Доставка команд (v4.0)
 
-1. **Заменить `throw new Exception` на ADT-ошибки** во всех парсерах:
-   - `TeltonikaParser.scala` — 8 мест с throw
-   - `WialonParser.scala` — 4 места с throw
-   - `RuptelaParser.scala` — 2 места с throw
-   - `NavTelecomParser.scala` — 5 мест с throw
-2. **Возвращать `IO[ParseError, T]`** вместо raw throw
-3. **Добавить метрики** по типам ошибок парсинга
+> Полностью реализовано: 10 типов команд, 5 энкодеров, Kafka `device-commands` → TCP
 
----
+**Архитектура (v4.0):**
+- Device Manager публикует команду в `device-commands` (key = instanceId)
+- CM потребляет через `kafkaConsumer.assign(partition)` (статический маппинг)
+- `CommandEncoder.forProtocol(protocol)` выбирает нужный энкодер
+- Трекер онлайн → отправка по TCP (<100ms)
+- Трекер offline → Redis ZSET `pending_commands:{imei}` backup
 
-## ✅ РЕШЕНО: Доставка команд (12 февраля 2026)
-
-### Kafka device-commands + Static Partition Assignment
-
-**Архитектура:** Каждый CM инстанс привязан к **своей партиции** Kafka топика `device-commands`.
-Маршрутизация: `protocol → instanceId → partition` (статичный маппинг).
-
-```
-teltonika  → cm-instance-1 → partition 0
-wialon     → cm-instance-2 → partition 1
-ruptela    → cm-instance-3 → partition 2
-navtelecom → cm-instance-4 → partition 3
-```
-
-**Device Manager** определяет protocol устройства из БД и публикует команду с key=instanceId.
-**Connection Manager** использует `kafkaConsumer.assign(partition)` (НЕ Consumer Group).
-
-**При получении команды из Kafka:**
-- Трекер онлайн → отправляем сразу по TCP (<100ms)
-- Трекер offline → in-memory queue + Redis ZSET backup (`pending_commands:{imei}`)
-
-**При подключении трекера:**
-- Объединяем in-memory queue + Redis backup
-- Дедупликация по `commandId`
-- Отправляем все pending команды
-- Очищаем in-memory + Redis
-
-### Redis disconnect: что очищаем и зачем
-
-При отключении трекера **очищаются только connection-поля** в Redis:
-- `connection_instance` → какой CM instance обслуживает трекер
-- `connection_time` → время подключения
-- `connection_ip` → IP адрес
-
-**НЕ очищаются:**
-- Позиция устройства (`lat`, `lon`, `speed`, `time`)
-- Контекст устройства (`vehicleId`, `orgId`, `hasGeozones`, `hasRetranslation`)
-
-Причина: при переподключении трекера (reconnect, сетевой сбой) контекст нужен сразу, а connection-поля обновятся при новом подключении.
+Подробности см. в разделе "Система команд" выше.
 
 ---
 
-## ⚠️ TODO: WebSocket / Real-time Service (MVP)
-
-### Архитектура передачи точек в реальном времени
+## ⚠️ TODO: WebSocket / Real-time Service (Block 3)
 
 **Решение для MVP:** Polling вместо WebSocket push
 
 ```
-Connection Manager
-    ↓ (Kafka: gps-events, ВСЕГДА)
-    ↓
-WebSocket/Real-time Service
-    ↓ (Kafka consumer, группирует по orgId)
-    ↓ хранит в памяти: Map[UserId, List[GpsPoint]]
-    ↓
-Frontend (polling каждые 3 сек)
-    → GET /api/v1/realtime/positions
-    ← JSON: {vehicles: [{id, lat, lon, speed, ...}]}
+CM → Kafka (gps-events, ALL points)
+  → WebSocket/Real-time Service (Kafka consumer, группирует по orgId)
+  → Frontend (polling каждые 3 сек)
+    GET /api/v1/realtime/positions → JSON: {vehicles: [...]}
 ```
 
-**Оптимизация:**
-- Флаг `isUserOnline` в Redis — если пользователь авторизован, его точки накапливаются
-- CM не знает про пользователей — просто шлёт ВСЁ в `gps-events`
-- Real-time Service подписан на `gps-events`, фильтрует по orgId авторизованных пользователей
-- 1000 пользователей × 10 машин × polling 3 сек = ~3300 RPS — нормально для zio-http
+CM не знает про пользователей — шлёт ВСЁ в `gps-events`. Real-time Service подписан на `gps-events`, фильтрует по `orgId` авторизованных пользователей.
+
+---
+
+**Дата:** 2 июня 2026
+**Версия:** 4.0
+**Статус:** 🟢 Документация актуальна | 18 протоколов | 10 команд | 10 Kafka топиков

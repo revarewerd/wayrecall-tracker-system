@@ -14,6 +14,30 @@
 [submodule "services/web-billing"]
 	path = services/web-billing
 	url = git@github.com:revarewerd/web-billing.git
-[submodule "services/API-Gateway"]
-	path = services/API-Gateway
+[submodule "services/api-gateway"]
+	path = services/api-gateway
 	url = git@github.com:revarewerd/api-gateway.git
+[submodule "services/admin-service"]
+	path = services/admin-service
+	url = git@github.com:revarewerd/admin-service.git
+[submodule "services/analytics-service"]
+	path = services/analytics-service
+	url = git@github.com:revarewerd/analytics-service.git
+[submodule "services/integration-service"]
+	path = services/integration-service
+	url = git@github.com:revarewerd/integration-service.git
+[submodule "services/maintenance-service"]
+	path = services/maintenance-service
+	url = git@github.com:revarewerd/maintenance-service.git
+[submodule "services/notification-service"]
+	path = services/notification-service
+	url = git@github.com:revarewerd/notification-service.git
+[submodule "services/rule-checker"]
+	path = services/rule-checker
+	url = git@github.com:revarewerd/rule-checker.git
+[submodule "services/sensors-service"]
+	path = services/sensors-service
+	url = git@github.com:revarewerd/sensors-service.git
+[submodule "services/user-service"]
+	path = services/user-service
+	url = git@github.com:revarewerd/user-service.git
