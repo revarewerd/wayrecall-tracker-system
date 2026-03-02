@@ -1,7 +1,9 @@
 # 💾 Data Stores: Схемы хранилищ
 
+> Тег: `АКТУАЛЬНО` | Обновлён: `2026-03-02` | Версия: `4.1`
+>
 > **Документ описывает:** TimescaleDB, PostgreSQL, Redis, Kafka  
-> **Версия:** 4.0 (добавлены таблицы из аудита legacy: drivers, vehicle_groups, sensor_profiles, audit_log)
+> **Версия:** 4.1 (добавлена информация о замене Redis на in-memory Ref)
 
 ---
 
@@ -918,6 +920,22 @@ CREATE INDEX idx_audit_log_entity
 
 ## 🔴 Redis 7
 
+> **⚠️ ТЕКУЩЕЕ ОГРАНИЧЕНИЕ (2026-03-02):**
+> Библиотека `zio-redis` несовместима с ZIO 2.0.20 + Scala 3.4.0. Зависимость **удалена из всех сервисов**.
+> Всё кэширование и state management, ранее использовавшие Redis, **временно реализованы через `ZIO Ref` (in-memory)**.
+> Это затрагивает:
+> - **notification-service:** ThrottleService (rate limiting) → Ref
+> - **sensors-service:** SensorStateStore → Ref
+> - **admin-service:** ConfigService → Ref
+> - **analytics-service:** ReportCache → Ref
+> - **maintenance-service:** MaintenanceCache → Ref
+> - **integration-service:** IntegrationConfigCache → Ref
+> - **rule-checker:** GeoZoneStateStore → Ref
+>
+> **Последствия:** данные кэша теряются при перезапуске сервиса. Не влияет на персистентные данные (PostgreSQL/TimescaleDB/Kafka).
+> **План:** подобрать совместимый Redis-клиент (redis4cats, jedis через ZIO interop или ожидание обновления zio-redis) и вернуть Redis.
+> Архитектурный дизайн ниже описывает **целевое состояние** с Redis.
+
 ### Конфигурация
 
 ```redis
@@ -1713,6 +1731,6 @@ COMMENT ON TABLE retranslation_targets IS
 
 ---
 
-**Дата:** 12 февраля 2026  
-**Обновлено:** убран Redis Pub/Sub из MVP, добавлены поля устройства из Stels, добавлена ретрансляция  
+**Дата:** 2 марта 2026  
+**Обновлено:** Redis временно заменён на ZIO Ref (in-memory) во всех сервисах из-за несовместимости zio-redis с ZIO 2.0.20 + Scala 3.4.0. Схемы Redis сохранены как целевой дизайн.  
 **Статус:** Data Stores документация обновлена ✅

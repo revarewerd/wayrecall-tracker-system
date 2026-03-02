@@ -1,20 +1,25 @@
 # 🏗️ Архитектура Wayrecall Tracker System
 
-> **Версия:** 3.0  
-> **Дата обновления:** 4 февраля 2026  
-> **Статус:** В разработке
+> Тег: `АКТУАЛЬНО` | Обновлён: `2026-06-02` | Версия: `4.0`
 
 ---
 
 ## 📋 Обзор
 
-Микросервисная GPS-система реального времени для мониторинга транспорта.
+Микросервисная GPS-система реального времени для мониторинга транспорта.  
+**14 сервисов** (12 Scala 3 + ZIO 2, 2 React/TypeScript).
 
-**Стек:** Scala 3 + ZIO 2 + Kafka + TimescaleDB + PostGIS + Redis
+**Стек:** Scala 3.4.0 + ZIO 2.0.20 + Kafka + TimescaleDB + PostGIS + Redis (lettuce)
+
+> **Redis (2026-06-02):** `zio-redis` несовместим. Connection Manager и API Gateway используют **lettuce-core 6.3.2**.
+> Остальные 7 сервисов используют **ZIO Ref** (in-memory) — допустимо для MVP.
+> Подробнее: [REDIS_VS_REF_DECISION.md](./REDIS_VS_REF_DECISION.md)
+>
+> Версии зависимостей: zio-kafka **2.7.3**, zio-logging **2.1.16**, doobie **1.0.0-RC4**, zio-http **3.0.0-RC4** / **3.0.1**.
 
 **Целевые показатели:**
-- 10,000+ трекеров
-- 10,000 GPS точек/сек
+- 20,000+ трекеров
+- 20,000 GPS точек/сек
 - Latency < 100ms (parse → Kafka)
 - 99.9% uptime
 
@@ -47,7 +52,7 @@
 │  ├─ PostgreSQL (master data)                                               │
 │  └─ Daily Sync Job (Redis ↔ PostgreSQL)                                    │
 │                                                                             │
-│  Подробнее: docs/ARCHITECTURE_BLOCK1.md                                    │
+│  Подробнее: docs/blocks/ARCHITECTURE_BLOCK1.md                             │
 └─────────────────────────────┬───────────────────────────────────────────────┘
                               │ Kafka: gps-events, gps-events-rules
                               ▼
@@ -64,7 +69,7 @@
 │  ├─ Reports (Excel/PDF/CSV)             ├─ Fuel calibration                │
 │  └─ Scheduled aggregation jobs          └─ Temperature monitoring          │
 │                                                                             │
-│  Подробнее: docs/ARCHITECTURE_BLOCK2.md                                    │
+│  Подробнее: docs/blocks/ARCHITECTURE_BLOCK2.md                             │
 └─────────────────────────────┬───────────────────────────────────────────────┘
                               │ REST / WebSocket
                               ▼
@@ -82,7 +87,7 @@
 │  ├─ Устройства и группы                                                    │
 │  └─ Отчёты и уведомления                                                   │
 │                                                                             │
-│  Подробнее: docs/ARCHITECTURE_BLOCK3.md                                    │
+│  Подробнее: docs/blocks/ARCHITECTURE_BLOCK3.md                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -127,6 +132,9 @@ Connection Manager
 
 ### Redis (HASH per device)
 
+> **⚠️ Текущее состояние:** Redis-клиент удалён из всех сервисов (несовместимость zio-redis).
+> Схема ниже описывает **целевой дизайн**. В текущей реализации используется ZIO `Ref` (in-memory).
+
 ```
 device:{imei}  (единый ключ на устройство)
 ├── CONTEXT (Device Manager пишет)
@@ -167,30 +175,34 @@ unknown:{imei}:attempts  (STRING, TTL 1h)
 
 ## 📦 Список сервисов
 
-### MVP (Block 1)
+### Block 1 — Сбор данных
 
 | # | Сервис | Порт | Статус |
 |---|--------|------|--------|
-| 1 | Connection Manager | TCP 5001-5004 | 🟡 В разработке |
-| 2 | History Writer | — (Kafka consumer) | 🟡 В разработке |
-| 3 | Device Manager | HTTP 8092 | 🟡 В разработке |
+| 1 | Connection Manager | TCP 5001-5017, HTTP 10090 | ✅ Компилируется |
+| 2 | Device Manager | HTTP 10092 | ✅ Компилируется |
+| 3 | History Writer | HTTP 10091 (Kafka consumer) | ✅ Компилируется |
 
-### Block 2 (Business Logic)
+### Block 2 — Бизнес-логика
 
-| # | Сервис | Описание | Статус |
-|---|--------|----------|--------|
-| 4 | Geozones Service | Enter/leave события | 📋 Спроектирован |
-| 5 | Notifications Service | Email/SMS/Push/Telegram | 📋 Планируется |
-| 6 | Analytics Service | Отчёты, агрегация | 📋 Планируется |
-| 7 | Sensors Service | Топливо, температура | 📋 Планируется |
+| # | Сервис | Порт | Статус |
+|---|--------|------|--------|
+| 4 | Rule Checker | HTTP 8093 | ✅ Компилируется |
+| 5 | Notification Service | HTTP 8094 | ✅ Компилируется |
+| 6 | Sensors Service | HTTP 8098 | ✅ Компилируется |
+| 7 | Integration Service | HTTP 8096 | ✅ Компилируется |
+| 8 | Analytics Service | HTTP 8095 | ✅ Компилируется |
+| 9 | Maintenance Service | HTTP 8087 | ✅ Компилируется |
+| 10 | Admin Service | HTTP 8097 | ✅ Компилируется |
+| 11 | User Service | HTTP 8091 | ✅ Компилируется |
 
-### Block 3 (Presentation)
+### Block 3 — Представление
 
-| # | Сервис | Описание | Статус |
-|---|--------|----------|--------|
-| 8 | API Gateway | REST API, auth | 📋 Планируется |
-| 9 | WebSocket Service | Realtime позиции | 📋 Планируется |
-| 10 | Web Frontend | React + Leaflet | 📋 Планируется |
+| # | Сервис | Порт | Статус |
+|---|--------|------|--------|
+| 12 | API Gateway | HTTP 8080 | ✅ Компилируется |
+| 13 | Web Frontend | HTTP 3001 | ✅ Компилируется |
+| 14 | Web Billing | HTTP 3002 | ✅ Компилируется (React shell) |
 
 ---
 
@@ -215,16 +227,28 @@ unknown:{imei}:attempts  (STRING, TTL 1h)
 ## 🎯 Порты
 
 ```
-TCP (GPS protocols):
-  5001: Teltonika
-  5002: Wialon
-  5003: Ruptela
-  5004: NavTelecom
+TCP (GPS protocols — 18 протоколов):
+  5001-5017: Connection Manager (Teltonika, Wialon, Ruptela, NavTelecom, etc.)
 
-HTTP (internal):
-  8092: Device Manager (REST API)
+HTTP (Block 1):
+  10090: Connection Manager (health, metrics)
+  10091: History Writer (health, metrics)
+  10092: Device Manager (REST API)
+
+HTTP (Block 2):
+  8087: Maintenance Service
+  8091: User Service
+  8093: Rule Checker
+  8094: Notification Service
+  8095: Analytics Service
+  8096: Integration Service
+  8097: Admin Service
+  8098: Sensors Service
+
+HTTP (Block 3):
   8080: API Gateway (public)
-  8081: WebSocket Gateway
+  3001: Web Frontend (React dev)
+  3002: Web Billing (React dev)
 
 Infrastructure:
   6379: Redis
@@ -238,14 +262,38 @@ Infrastructure:
 
 ## 📚 Связанные документы
 
-- [ARCHITECTURE_BLOCK1.md](./ARCHITECTURE_BLOCK1.md) — Сбор данных
-- [ARCHITECTURE_BLOCK2.md](./ARCHITECTURE_BLOCK2.md) — Бизнес-логика
-- [ARCHITECTURE_BLOCK3.md](./ARCHITECTURE_BLOCK3.md) — Представление
+### Архитектура блоков
+- [blocks/ARCHITECTURE_BLOCK1.md](./blocks/ARCHITECTURE_BLOCK1.md) — Сбор данных (CM, DM, HW)
+- [blocks/ARCHITECTURE_BLOCK2.md](./blocks/ARCHITECTURE_BLOCK2.md) — Бизнес-логика (8 сервисов)
+- [blocks/ARCHITECTURE_BLOCK3.md](./blocks/ARCHITECTURE_BLOCK3.md) — Представление (API GW, WS, Frontend)
+
+### Анализ и решения
+- [REDIS_VS_REF_DECISION.md](./REDIS_VS_REF_DECISION.md) — Redis (lettuce) vs ZIO Ref
+- [STELS_GAP_ANALYSIS.md](./STELS_GAP_ANALYSIS.md) — Gap-анализ: legacy Stels vs новая система
+- [REALTIME_POSITIONS_DESIGN.md](./REALTIME_POSITIONS_DESIGN.md) — Real-time отображение позиций
+
+### Хранилища и данные
 - [DATA_STORES.md](./DATA_STORES.md) — Схемы хранилищ
+
+### Сервисы
 - [services/CONNECTION_MANAGER.md](./services/CONNECTION_MANAGER.md) — Connection Manager
 - [services/DEVICE_MANAGER.md](./services/DEVICE_MANAGER.md) — Device Manager
+- [services/HISTORY_WRITER.md](./services/HISTORY_WRITER.md) — History Writer
+- [services/GEOZONES_SERVICE.md](./services/GEOZONES_SERVICE.md) — Rule Checker (Geozones)
+- [services/NOTIFICATIONS_SERVICE.md](./services/NOTIFICATIONS_SERVICE.md) — Notification Service
+- [services/SENSORS_SERVICE.md](./services/SENSORS_SERVICE.md) — Sensors Service
+- [services/ANALYTICS_SERVICE.md](./services/ANALYTICS_SERVICE.md) — Analytics Service
+- [services/MAINTENANCE_SERVICE.md](./services/MAINTENANCE_SERVICE.md) — Maintenance Service
+- [services/INTEGRATION_SERVICE.md](./services/INTEGRATION_SERVICE.md) — Integration Service
+- [services/ADMIN_SERVICE.md](./services/ADMIN_SERVICE.md) — Admin Service
+- [services/USER_SERVICE.md](./services/USER_SERVICE.md) — User Service
+- [services/API_GATEWAY.md](./services/API_GATEWAY.md) — API Gateway
+- [services/WEB_FRONTEND.md](./services/WEB_FRONTEND.md) — Web Frontend
+
+### Legacy
+- [stels/LEGACY_API.md](./stels/LEGACY_API.md) — 78 методов старого API
 
 ---
 
-**Версия:** 3.0  
-**Дата:** 4 февраля 2026
+**Версия:** 4.0  
+**Дата:** 2 июня 2026

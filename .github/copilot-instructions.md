@@ -222,9 +222,10 @@ wayrecall-tracker/
 │   └── scripts/
 ├── docs/                           # Системная документация
 │   ├── ARCHITECTURE.md             # Общая архитектура (3 блока)
-│   ├── ARCHITECTURE_BLOCK1.md      # Block 1: Data Collection
-│   ├── ARCHITECTURE_BLOCK2.md      # Block 2: Business Logic
-│   ├── ARCHITECTURE_BLOCK3.md      # Block 3: Presentation
+│   ├── blocks/
+│   │   ├── ARCHITECTURE_BLOCK1.md  # Block 1: Data Collection
+│   │   ├── ARCHITECTURE_BLOCK2.md  # Block 2: Business Logic
+│   │   └── ARCHITECTURE_BLOCK3.md  # Block 3: Presentation
 │   ├── DATA_STORES.md
 │   ├── AI_AGENTS_INSTRUCTIONS.md
 │   └── services/
@@ -827,9 +828,9 @@ Scope: cm, dm, hw, rc, ns, as, us, ads, is, ms, ss, infra, docs
 
 **Системная архитектура:**
 - **[docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)** — общая архитектура 3 блоков
-- **[docs/ARCHITECTURE_BLOCK1.md](../docs/ARCHITECTURE_BLOCK1.md)** — Data Collection
-- **[docs/ARCHITECTURE_BLOCK2.md](../docs/ARCHITECTURE_BLOCK2.md)** — Business Logic
-- **[docs/ARCHITECTURE_BLOCK3.md](../docs/ARCHITECTURE_BLOCK3.md)** — Presentation
+- **[docs/blocks/ARCHITECTURE_BLOCK1.md](../docs/blocks/ARCHITECTURE_BLOCK1.md)** — Data Collection
+- **[docs/blocks/ARCHITECTURE_BLOCK2.md](../docs/blocks/ARCHITECTURE_BLOCK2.md)** — Business Logic
+- **[docs/blocks/ARCHITECTURE_BLOCK3.md](../docs/blocks/ARCHITECTURE_BLOCK3.md)** — Presentation
 
 **Инфраструктура (общая для всех сервисов):**
 - **[infra/kafka/TOPICS.md](../infra/kafka/TOPICS.md)** — Все Kafka топики, маршруты, JSON схемы

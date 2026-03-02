@@ -58,12 +58,8 @@ dist/
 # TimescaleDB
 pgdata/
 
-# Книги и учебные материалы (PDF/epub — хранятся локально)
-books/
-
 # Тестовые данные (бинарные дампы, pcap — хранятся локально)
 resources/
 
 # Временные файлы
-instruct.md
 indexAllDocs.md

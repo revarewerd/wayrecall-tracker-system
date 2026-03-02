@@ -1,22 +1,31 @@
 # 🖥️ Block 3: Представление
 
-> **Ответственность:** API для клиентов, аутентификация, real-time обновления, веб-интерфейс, администрирование  
+> Тег: `АКТУАЛЬНО` | Обновлён: `2026-03-06` | Версия: `2.0`
+>
+> **Ответственность:** API для клиентов, аутентификация, real-time обновления, веб-интерфейс  
 > **Сервисы (6):** API Gateway, Auth Service, User Service, WebSocket Service, Admin Service, Web Frontend
+
+> **PostMVP:** Billing Service (тарифы, платежи), Route Service (маршруты, путевые листы)
 
 ---
 
-## 📋 Полный список сервисов Block 3
+## 📑 Содержание
 
-| # | Сервис | Назначение | MVP | Статус |
-|---|--------|------------|-----|--------|
-| 1 | **API Gateway** | REST API, маршрутизация, rate limiting | ✅ | 📋 Спроектирован |
-| 2 | **Auth Service** | JWT токены, сессии, OAuth | ✅ | 📋 Планируется |
-| 3 | **User Service** | Пользователи, роли, права, организации | ✅ | 📋 Планируется |
-| 4 | **WebSocket Service** | Real-time позиции, события, алерты | ✅ | 📋 Спроектирован |
-| 5 | **Admin Service** | Панель управления системой, аудит | ✅ | 📋 Планируется |
-| 6 | **Web Frontend** | React + Leaflet карта | ✅ | 📋 Планируется |
-
-> **PostMVP сервисы:** Billing Service (тарифы, платежи), Route Service (маршруты, путевые листы)
+1. [Обзор блока](#-обзор-блока)
+2. [Диаграмма компонентов](#-диаграмма-компонентов)
+3. [UML: Доменная модель](#-uml-доменная-модель-block-3)
+4. [API Gateway](#-api-gateway)
+5. [Auth Service](#-auth-service)
+6. [User Service](#-user-service)
+7. [WebSocket Service](#-websocket-service)
+8. [Admin Service (Block 3 часть)](#-admin-service-block-3)
+9. [Web Frontend](#-web-frontend)
+10. [State Diagrams](#-state-diagrams)
+11. [Взаимодействие сервисов](#-взаимодействие-всех-сервисов-block-3)
+12. [ER: Базы данных](#-er-базы-данных-block-3)
+13. [REST API Reference](#-rest-api-reference)
+14. [Сводная таблица](#-сводная-таблица-block-3)
+15. [Deployment](#-deployment)
 
 ---
 
@@ -31,11 +40,8 @@
 │  │                     Web Frontend                          │             │
 │  │                  React + Leaflet Map                      │             │
 │  └───────────────────────────┬───────────────────────────────┘             │
-│                              │                                              │
-│                    HTTP / WebSocket                                         │
-│                              │                                              │
+│                       HTTP / │ WebSocket                                    │
 │          ┌───────────────────┴───────────────────┐                         │
-│          │                                       │                         │
 │          ▼                                       ▼                         │
 │  ┌───────────────┐                      ┌───────────────┐                  │
 │  │  API Gateway  │                      │   WebSocket   │                  │
@@ -43,81 +49,296 @@
 │  │    :8080      │                      │    :8081      │                  │
 │  └───────┬───────┘                      └───────┬───────┘                  │
 │          │                                      │                          │
-│          ▼                                      │                          │
-│  ┌───────────────┐  ┌───────────────┐          │ Redis Pub/Sub            │
-│  │ Auth Service  │  │ User Service  │          │ Kafka                    │
-│  │  (JWT, OAuth) │  │ (Users, Orgs) │          │                          │
-│  │    :8082      │  │    :8083      │          │                          │
-│  └───────────────┘  └───────────────┘          │                          │
+│  ┌───────┴───────┐                     Kafka + Redis Pub/Sub               │
+│  │  Auth Service │                              │                          │
+│  │  (JWT, OAuth) │                              │                          │
+│  │    :8082      │                              │                          │
+│  └───────────────┘                              │                          │
 │          │                                      │                          │
-│          └──────────────────────────────────────┘                          │
-│                               │                                             │
-│                               ▼                                             │
+│          └──────────────────┬───────────────────┘                          │
+│                             ▼                                               │
 │  ┌─────────────────────────────────────────────────────────────┐           │
-│  │         Block 1 & Block 2 Services                           │           │
-│  │         PostgreSQL, TimescaleDB, Redis                       │           │
+│  │         Block 1 & Block 2 Services (backend)                 │           │
 │  └─────────────────────────────────────────────────────────────┘           │
-│                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Все сервисы Block 3
+
+| # | Сервис | Порт | Тип | Хранилище | Статус |
+|---|--------|------|-----|-----------|--------|
+| 1 | **API Gateway** | 8080 | REST proxy | Redis (lettuce) — rate limit, cache | MVP |
+| 2 | **Auth Service** | 8082 | REST | PostgreSQL + Redis — sessions, tokens | MVP |
+| 3 | **User Service** | 8091 | REST | PostgreSQL — users, orgs, roles | MVP |
+| 4 | **WebSocket Service** | 8081 | WS | Redis Pub/Sub, Kafka | MVP |
+| 5 | **Admin Service** | 8097 | REST | PostgreSQL — config, audit | MVP |
+| 6 | **Web Frontend** | 3001 | SPA | — (browser state) | MVP |
+
 ---
 
-## 🔄 Потоки данных Block 3
+## 🧩 Диаграмма компонентов
 
 ```mermaid
 flowchart TB
     subgraph Clients["Клиенты"]
-        Web[Web Browser]
-        Mobile[Mobile App]
-        Third[Third-party API]
+        Browser["🌐 Web Browser"]
+        Mobile["📱 Mobile App"]
+        ThirdParty["🔌 Third-party API"]
     end
 
     subgraph Gateway["API Gateway :8080"]
-        AuthMW[Auth Middleware]
-        RateLimit[Rate Limiter]
-        Router[Router]
+        CORS["CORS"]
+        JWT["JWT Validator"]
+        RateLimit["Rate Limiter\n(Token Bucket)"]
+        Router["Router\n/api/v1/*"]
     end
 
     subgraph Auth["Auth Service :8082"]
-        Login[Login/Logout]
-        TokenMgr[Token Manager]
-        OAuth[OAuth Providers]
+        Login["Login/Logout"]
+        TokenMgr["Token Manager\n(RS256)"]
+        OAuth["OAuth2.0\n(Google, Yandex)"]
+        Refresh["Token Refresh"]
     end
 
-    subgraph Users["User Service :8083"]
-        UserCRUD[User CRUD]
-        OrgMgr[Org Manager]
-        Roles[Role Manager]
+    subgraph Users["User Service :8091"]
+        UserCRUD["User CRUD"]
+        OrgMgr["Org Manager"]
+        RBAC["RBAC\n(4 roles)"]
+        Invite["Invitations"]
     end
 
     subgraph WS["WebSocket Service :8081"]
-        WSHandler[WS Handler]
-        RoomManager[Room Manager]
-        Broadcaster[Broadcaster]
+        Upgrader["HTTP→WS Upgrader"]
+        RoomMgr["Room Manager\n(org, device, alerts)"]
+        Broadcaster["Event Broadcaster"]
     end
 
-    subgraph Backend["Backend Services"]
-        DM[Device Manager]
-        GS[Geozones Service]
-        AS[Analytics Service]
+    subgraph Block12["Block 1 & 2 Services"]
+        DM["Device Manager"]
+        HW["History Writer"]
+        RC["Rule Checker"]
+        AS["Analytics Service"]
+        SS["Sensors Service"]
     end
 
-    subgraph Storage["Хранилища"]
-        PG[(PostgreSQL)]
-        TSDB[(TimescaleDB)]
-        Redis[(Redis)]
-        Kafka[(Kafka)]
+    subgraph Infra["Инфраструктура"]
+        PG[("PostgreSQL")]
+        Redis[("Redis")]
+        Kafka[("Kafka")]
     end
 
-    Web & Mobile & Third --> Auth --> RateLimit --> Router
-    Router --> DM & GS & AS
-    DM & GS & AS --> PG & TSDB
-    
-    Web & Mobile --> WSHandler
-    WSHandler --> RoomManager
-    Kafka --> Broadcaster --> RoomManager --> Web & Mobile
-    Redis --> Broadcaster
+    Browser & Mobile & ThirdParty --> CORS --> JWT --> RateLimit --> Router
+    Router --> DM & HW & RC & AS & SS
+    Router --> Auth & Users
+
+    Browser --> Upgrader --> RoomMgr
+    Kafka --> Broadcaster --> RoomMgr --> Browser
+
+    Auth --> PG & Redis
+    Users --> PG
+    Gateway --> Redis
+```
+
+---
+
+## 🏗️ UML: Доменная модель Block 3
+
+### Аутентификация и сессии
+
+```mermaid
+classDiagram
+    class JwtToken {
+        +String sub
+        +Int orgId
+        +String role
+        +List~String~ permissions
+        +Long iat
+        +Long exp
+        +String jti
+    }
+
+    class RefreshToken {
+        +UUID id
+        +Int userId
+        +String tokenHash
+        +Json deviceInfo
+        +Instant expiresAt
+        +Instant revokedAt
+    }
+
+    class AuthEvent {
+        +Long id
+        +Int userId
+        +AuthEventType eventType
+        +String ipAddress
+        +String userAgent
+        +Instant createdAt
+    }
+
+    class AuthEventType {
+        <<enumeration>>
+        LOGIN_SUCCESS
+        LOGIN_FAILED
+        LOGOUT
+        TOKEN_REFRESH
+        PASSWORD_CHANGE
+        OAUTH_LOGIN
+    }
+
+    class OAuthProvider {
+        <<enumeration>>
+        GOOGLE
+        YANDEX
+    }
+
+    class ApiKey {
+        +Int id
+        +Int organizationId
+        +String keyHash
+        +String name
+        +List~String~ permissions
+        +Int rateLimit
+        +Instant expiresAt
+    }
+
+    JwtToken --> OAuthProvider : optional provider
+    AuthEvent --> AuthEventType
+    RefreshToken --> JwtToken : generates
+```
+
+### WebSocket протокол
+
+```mermaid
+classDiagram
+    class WsMessage {
+        <<sealed trait>>
+        +String type
+    }
+
+    class SubscribeMsg {
+        +String channel
+    }
+    class UnsubscribeMsg {
+        +String channel
+    }
+
+    class PositionUpdate {
+        +Int deviceId
+        +Double lat
+        +Double lon
+        +Int speed
+        +Int course
+        +Instant timestamp
+    }
+
+    class GeozoneEventMsg {
+        +Int deviceId
+        +String event
+        +Int geozoneId
+        +String geozoneName
+        +Instant timestamp
+    }
+
+    class AlertMsg {
+        +Int deviceId
+        +String alertType
+        +Double value
+        +Double threshold
+        +Instant timestamp
+    }
+
+    class ConnectionStatusMsg {
+        +Int deviceId
+        +String status
+        +String protocol
+        +Instant connectedAt
+    }
+
+    class CommandResponseMsg {
+        +Int deviceId
+        +Int commandId
+        +String status
+        +String response
+    }
+
+    WsMessage <|-- SubscribeMsg
+    WsMessage <|-- UnsubscribeMsg
+    WsMessage <|-- PositionUpdate
+    WsMessage <|-- GeozoneEventMsg
+    WsMessage <|-- AlertMsg
+    WsMessage <|-- ConnectionStatusMsg
+    WsMessage <|-- CommandResponseMsg
+```
+
+### RBAC: Роли и права
+
+```mermaid
+classDiagram
+    class User {
+        +Int id
+        +Int organizationId
+        +String email
+        +String passwordHash
+        +String name
+        +Int roleId
+        +Boolean isActive
+    }
+
+    class Organization {
+        +Int id
+        +String name
+        +SubscriptionType subscriptionType
+        +Int maxDevices
+        +Int maxUsers
+        +Json settings
+    }
+
+    class Role {
+        +Int id
+        +String name
+        +String displayName
+        +List~Permission~ permissions
+        +Boolean isSystem
+    }
+
+    class Permission {
+        <<enumeration>>
+        DEVICES_READ
+        DEVICES_WRITE
+        DEVICES_DELETE
+        COMMANDS_SEND
+        GEOZONES_READ
+        GEOZONES_WRITE
+        REPORTS_READ
+        REPORTS_CREATE
+        USERS_READ
+        USERS_WRITE
+        ADMIN_ALL
+    }
+
+    class SubscriptionType {
+        <<enumeration>>
+        TRIAL
+        BASIC
+        PRO
+        ENTERPRISE
+    }
+
+    class UserInvitation {
+        +Int id
+        +Int organizationId
+        +String email
+        +Int roleId
+        +String token
+        +Instant expiresAt
+        +Instant acceptedAt
+    }
+
+    Organization "1" --> "*" User : contains
+    Role "1" --> "*" User : assigned
+    Role --> "*" Permission : grants
+    Organization --> SubscriptionType
+    Organization "1" --> "*" UserInvitation : sends
 ```
 
 ---
@@ -126,178 +347,57 @@ flowchart TB
 
 ### Обзор
 
-**Ответственность:** REST API, аутентификация, авторизация, rate limiting, маршрутизация
+| Параметр | Значение |
+|----------|----------|
+| **Ответственность** | REST API, маршрутизация, rate limiting, аутентификация |
+| **Порт** | 8080 |
+| **State** | Redis (lettuce) — rate limit counters, JWT cache |
+| **Auth** | JWT validation (RS256) |
 
-**Порт:** 8080
-
-### Архитектура сервиса
+### Middleware Stack
 
 ```mermaid
 flowchart TB
-    subgraph Incoming["Входящие запросы"]
-        HTTP[HTTP Requests]
+    subgraph Request["HTTP Request"]
+        R["GET /api/v1/devices\nAuthorization: Bearer xxx"]
     end
 
-    subgraph Middleware["Middleware Stack"]
-        Logger[Request Logger]
-        CORS[CORS Handler]
-        Auth[JWT Authenticator]
-        Authz[Authorizer]
-        RateLimit[Rate Limiter]
+    subgraph Pipeline["Middleware Pipeline"]
+        direction TB
+        L["1. Logger\n(request_id, method, path)"]
+        C["2. CORS\n(allowed origins)"]
+        A["3. JWT Authenticator\n(validate signature, expiry)"]
+        Z["4. Authorizer\n(check permissions for route)"]
+        RL["5. Rate Limiter\n(Token Bucket, per user)"]
+        RO["6. Router\n(match path → handler)"]
     end
 
-    subgraph Handlers["Route Handlers"]
-        DevicesH[/api/v1/devices]
-        TrackH[/api/v1/track]
-        GeozonesH[/api/v1/geozones]
-        ReportsH[/api/v1/reports]
-        UsersH[/api/v1/users]
-        AlertsH[/api/v1/alerts]
+    subgraph Handler["Route Handler"]
+        H["DevicesHandler\n→ proxy to Device Manager"]
     end
 
-    subgraph Services["Backend Services"]
-        DM[Device Manager]
-        HW[History (TimescaleDB)]
-        GS[Geozones Service]
-        AS[Analytics Service]
-        NS[Notifications]
-    end
-
-    HTTP --> Logger --> CORS --> Auth --> Authz --> RateLimit
-    RateLimit --> DevicesH & TrackH & GeozonesH & ReportsH & UsersH & AlertsH
-    
-    DevicesH --> DM
-    TrackH --> HW
-    GeozonesH --> GS
-    ReportsH --> AS
-    AlertsH --> NS
+    R --> L --> C --> A --> Z --> RL --> RO --> H
 ```
 
-### REST API Endpoints
-
-#### Устройства
-
-```yaml
-# Device Management
-GET    /api/v1/devices                    # Список устройств
-GET    /api/v1/devices/{id}               # Одно устройство
-POST   /api/v1/devices                    # Создать устройство
-PUT    /api/v1/devices/{id}               # Обновить устройство
-DELETE /api/v1/devices/{id}               # Удалить устройство
-
-# Device Position & Track
-GET    /api/v1/devices/{id}/position      # Последняя позиция
-GET    /api/v1/devices/{id}/track         # Трек за период
-  Query params:
-    - from: ISO8601 datetime
-    - to: ISO8601 datetime
-    - simplify: boolean (упростить для отображения)
-
-# Device Commands
-POST   /api/v1/devices/{id}/commands      # Отправить команду
-GET    /api/v1/devices/{id}/commands      # История команд
-
-# Bulk Operations
-GET    /api/v1/devices/positions          # Позиции всех устройств
-POST   /api/v1/devices/export             # Экспорт в CSV
-POST   /api/v1/devices/import             # Импорт из CSV
-```
-
-#### Геозоны
-
-```yaml
-GET    /api/v1/geozones                   # Список геозон
-GET    /api/v1/geozones/{id}              # Одна геозона
-POST   /api/v1/geozones                   # Создать геозону
-PUT    /api/v1/geozones/{id}              # Обновить геозону
-DELETE /api/v1/geozones/{id}              # Удалить геозону
-
-# Geozone Events
-GET    /api/v1/geozones/{id}/events       # События по геозоне
-GET    /api/v1/devices/{id}/geozone-events # События по устройству
-```
-
-#### Отчёты
-
-```yaml
-POST   /api/v1/reports                    # Создать отчёт
-GET    /api/v1/reports/{id}               # Статус/скачать отчёт
-GET    /api/v1/reports                    # История отчётов
-
-# Quick Stats (без генерации файла)
-GET    /api/v1/devices/{id}/stats         # Статистика за период
-GET    /api/v1/devices/{id}/trips         # Список поездок
-GET    /api/v1/devices/{id}/stops         # Список остановок
-```
-
-#### Пользователи и Организации
-
-```yaml
-# Auth
-POST   /api/v1/auth/login                 # Логин (получить JWT)
-POST   /api/v1/auth/refresh               # Обновить токен
-POST   /api/v1/auth/logout                # Выход
-
-# Users
-GET    /api/v1/users                      # Список пользователей (admin)
-GET    /api/v1/users/me                   # Текущий пользователь
-PUT    /api/v1/users/me                   # Обновить профиль
-PUT    /api/v1/users/me/password          # Сменить пароль
-
-# Organizations
-GET    /api/v1/organizations/{id}         # Информация об организации
-PUT    /api/v1/organizations/{id}         # Обновить (admin)
-```
-
-### Sequence Diagram: Аутентификация
+### Rate Limiting: Token Bucket
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant AG as API Gateway
-    participant R as Redis
-    participant DB as PostgreSQL
+    participant GW as API Gateway
+    participant R as Redis (lettuce)
 
-    C->>AG: POST /auth/login {email, password}
-    AG->>DB: SELECT user WHERE email = ?
-    DB-->>AG: User record
+    C->>GW: GET /api/v1/devices (user_id=42)
     
-    AG->>AG: Verify password (bcrypt)
-    
-    alt Пароль верный
-        AG->>AG: Generate JWT (access + refresh)
-        AG->>R: SET refresh_token:{user_id} = token
-        AG-->>C: {access_token, refresh_token, expires_in}
-    else Пароль неверный
-        AG-->>C: 401 Unauthorized
-    end
+    GW->>R: MULTI<br/>INCR rate_limit:42:2026-03-06T12:00<br/>EXPIRE rate_limit:42:2026-03-06T12:00 60<br/>EXEC
+    R-->>GW: count = 15
 
-    Note over C,AG: Последующие запросы
-
-    C->>AG: GET /api/v1/devices (Authorization: Bearer {token})
-    AG->>AG: Validate JWT
-    AG->>AG: Check permissions
-    AG->>AG: Route to handler
-    AG-->>C: 200 {devices: [...]}
-```
-
-### Sequence Diagram: Rate Limiting
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant AG as API Gateway
-    participant R as Redis
-
-    C->>AG: GET /api/v1/devices
-    AG->>R: INCR rate:{user_id}:{minute}
-    R-->>AG: count = 15
-    
-    alt count <= limit (100/min)
-        AG->>AG: Process request
-        AG-->>C: 200 OK
-    else count > limit
-        AG-->>C: 429 Too Many Requests
+    alt count <= 100/min
+        GW->>GW: Process request
+        GW-->>C: 200 OK
+        Note right of GW: X-RateLimit-Remaining: 85
+    else count > 100/min
+        GW-->>C: 429 Too Many Requests
         Note right of C: Retry-After: 30
     end
 ```
@@ -311,158 +411,65 @@ sequenceDiagram
     "typ": "JWT"
   },
   "payload": {
-    "sub": "user_123",              // user ID
-    "org": "org_456",               // organization ID
-    "role": "operator",             // admin, manager, operator, viewer
-    "permissions": ["read", "write", "commands"],
-    "iat": 1706270400,              // issued at
-    "exp": 1706274000               // expires (1 hour)
+    "sub": "user_42",
+    "org": 123,
+    "role": "operator",
+    "permissions": ["devices.read", "commands.send", "geozones.read"],
+    "iat": 1709712000,
+    "exp": 1709715600,
+    "jti": "unique-token-id"
   }
 }
 ```
 
-### PostgreSQL схема
-
-```sql
--- Пользователи
-CREATE TABLE users (
-    id SERIAL PRIMARY KEY,
-    organization_id INTEGER REFERENCES organizations(id),
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    name VARCHAR(100),
-    role VARCHAR(20) NOT NULL DEFAULT 'viewer',  -- admin, manager, operator, viewer
-    permissions JSONB DEFAULT '[]',
-    is_active BOOLEAN DEFAULT true,
-    last_login_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_users_org ON users (organization_id) WHERE is_active = true;
-CREATE INDEX idx_users_email ON users (email);
-
--- Организации
-CREATE TABLE organizations (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(100) NOT NULL,
-    subscription_type VARCHAR(20) DEFAULT 'trial',  -- trial, basic, pro, enterprise
-    max_devices INTEGER DEFAULT 10,
-    settings JSONB DEFAULT '{}',
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- API Keys (для интеграций)
-CREATE TABLE api_keys (
-    id SERIAL PRIMARY KEY,
-    organization_id INTEGER REFERENCES organizations(id),
-    key_hash VARCHAR(255) UNIQUE NOT NULL,
-    name VARCHAR(100),
-    permissions JSONB DEFAULT '[]',
-    rate_limit INTEGER DEFAULT 1000,  -- requests per minute
-    last_used_at TIMESTAMPTZ,
-    expires_at TIMESTAMPTZ,
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_api_keys_hash ON api_keys (key_hash) WHERE is_active = true;
-```
-
-### Prometheus метрики
-
-```
-# HTTP requests
-http_requests_total{method="GET", path="/api/v1/devices", status="200"} 150000
-http_requests_total{method="POST", path="/api/v1/auth/login", status="401"} 350
-
-# Latency
-http_request_duration_ms{method="GET", path="/api/v1/devices", quantile="0.5"} 25
-http_request_duration_ms{method="GET", path="/api/v1/devices", quantile="0.99"} 150
-
-# Rate limiting
-rate_limit_exceeded_total{user_id="123"} 45
-
-# Auth
-auth_login_total{status="success"} 5000
-auth_login_total{status="failed"} 150
-auth_token_refresh_total 12000
-```
-
 ---
 
-## � Auth Service
+## 🔐 Auth Service
 
 ### Обзор
 
-**Ответственность:** Аутентификация, JWT токены, сессии, OAuth
+| Параметр | Значение |
+|----------|----------|
+| **Ответственность** | JWT токены, сессии, OAuth2.0 |
+| **Порт** | 8082 |
+| **Access Token TTL** | 15 минут (RS256) |
+| **Refresh Token TTL** | 7 дней (stored in Redis + DB) |
 
-**Порт:** 8082
-
-### Архитектура сервиса
-
-```mermaid
-flowchart TB
-    subgraph Clients["Клиенты"]
-        Web[Web Browser]
-        Mobile[Mobile App]
-        API[API Gateway]
-    end
-
-    subgraph AS["Auth Service"]
-        Login[Login Handler]
-        TokenGen[Token Generator]
-        TokenVal[Token Validator]
-        Refresh[Refresh Handler]
-        OAuth[OAuth Handler]
-    end
-
-    subgraph Storage["Хранилища"]
-        PG[(PostgreSQL)]
-        Redis[(Redis\nsessions)]
-    end
-
-    subgraph External["Внешние провайдеры"]
-        Google[Google OAuth]
-        Yandex[Yandex OAuth]
-    end
-
-    Clients --> Login --> TokenGen --> PG
-    TokenGen --> Redis
-    API --> TokenVal --> Redis
-    Clients --> Refresh --> Redis
-    Clients --> OAuth --> Google & Yandex
-    OAuth --> TokenGen
-```
-
-### Sequence Diagram: Login Flow
+### Sequence Diagram: Полный Login Flow
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant AG as API Gateway
+    participant B as 🌐 Browser
+    participant GW as API Gateway
     participant AS as Auth Service
+    participant US as User Service
     participant DB as PostgreSQL
     participant R as Redis
 
-    C->>AG: POST /auth/login {email, password}
-    AG->>AS: Forward request
-    AS->>DB: SELECT user WHERE email = ?
-    DB-->>AS: User record
+    B->>GW: POST /auth/login {email, password}
+    GW->>AS: Forward (no auth required)
     
-    AS->>AS: Verify password (bcrypt)
-    
+    AS->>US: GET /internal/users/by-email?email=admin@company.com
+    US->>DB: SELECT * FROM users WHERE email = ?
+    DB-->>US: User {id:42, password_hash:"$2b$...", role_id:1}
+    US-->>AS: User record
+
+    AS->>AS: BCrypt.verify(password, hash)
+
     alt Пароль верный
-        AS->>AS: Generate access_token (15 min)
-        AS->>AS: Generate refresh_token (7 days)
-        AS->>R: SET refresh:{user_id}:{token_id} = metadata
-        AS->>DB: UPDATE last_login_at
-        AS-->>C: {access_token, refresh_token, expires_in}
+        AS->>AS: Generate access_token (RS256, 15min)
+        AS->>AS: Generate refresh_token (UUID + hash)
+        AS->>DB: INSERT INTO refresh_tokens (user_id, token_hash, device_info, expires_at)
+        AS->>R: SETEX auth:session:42:abc123 604800 {metadata}
+        AS->>DB: INSERT INTO auth_log (event_type='login_success')
+
+        AS-->>GW: {access_token, refresh_token, expires_in: 900}
+        GW-->>B: 200 OK + Set-Cookie: refresh_token
     else Пароль неверный
-        AS->>DB: Log failed attempt
-        AS-->>C: 401 Unauthorized
+        AS->>R: INCR auth:rate:192.168.1.1
+        AS->>DB: INSERT INTO auth_log (event_type='login_failed')
+        AS-->>GW: 401 Unauthorized
+        GW-->>B: 401 {error: "Invalid credentials"}
     end
 ```
 
@@ -470,94 +477,65 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
+    participant B as 🌐 Browser
     participant AS as Auth Service
     participant R as Redis
+    participant DB as PostgreSQL
 
-    C->>AS: POST /auth/refresh {refresh_token}
+    Note over B: Access token expired (401)
+
+    B->>AS: POST /auth/refresh {refresh_token}
     AS->>AS: Validate refresh_token signature
-    AS->>R: GET refresh:{user_id}:{token_id}
+    AS->>AS: Hash token → lookup
+
+    AS->>R: GET auth:session:42:abc123
     
-    alt Токен валиден
-        R-->>AS: Token metadata
-        AS->>AS: Generate new access_token
-        AS->>R: Update token metadata
-        AS-->>C: {access_token, expires_in}
-    else Токен невалиден/истёк
-        AS-->>C: 401 Unauthorized
+    alt Сессия найдена
+        R-->>AS: {user_id:42, created_at, device}
+        AS->>DB: SELECT * FROM refresh_tokens WHERE token_hash = ? AND revoked_at IS NULL
+        DB-->>AS: Token record (valid, not expired)
+
+        AS->>AS: Generate new access_token (15 min)
+        AS->>R: Update session metadata
+        AS-->>B: {access_token, expires_in: 900}
+    else Сессия не найдена / истекла
+        AS-->>B: 401 {error: "Session expired, please login"}
     end
 ```
 
-### REST API
+### OAuth2.0 Flow
 
-```yaml
-# Authentication
-POST   /auth/login                # Login (email + password)
-POST   /auth/logout               # Logout (invalidate tokens)
-POST   /auth/refresh              # Refresh access token
-POST   /auth/password/reset       # Request password reset
-POST   /auth/password/change      # Change password (authenticated)
+```mermaid
+sequenceDiagram
+    participant B as 🌐 Browser
+    participant AS as Auth Service
+    participant G as Google OAuth
+    participant US as User Service
 
-# OAuth
-GET    /auth/oauth/google         # Redirect to Google
-GET    /auth/oauth/google/callback  # Google callback
-GET    /auth/oauth/yandex         # Redirect to Yandex
-GET    /auth/oauth/yandex/callback  # Yandex callback
+    B->>AS: GET /auth/oauth/google
+    AS-->>B: Redirect → Google OAuth consent screen
 
-# Token validation (internal)
-POST   /auth/validate             # Validate access token
-```
+    B->>G: User grants permission
+    G-->>B: Redirect → /auth/oauth/google/callback?code=xxx
 
-### PostgreSQL схема
+    B->>AS: GET /auth/oauth/google/callback?code=xxx
+    AS->>G: POST /token {code, client_id, client_secret}
+    G-->>AS: {access_token, id_token}
 
-```sql
--- Refresh токены
-CREATE TABLE refresh_tokens (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    token_hash VARCHAR(255) NOT NULL,
-    device_info JSONB,                     -- {user_agent, ip, device}
-    expires_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    revoked_at TIMESTAMPTZ
-);
+    AS->>G: GET /userinfo (access_token)
+    G-->>AS: {email, name, picture}
 
-CREATE INDEX idx_refresh_tokens_user ON refresh_tokens (user_id) WHERE revoked_at IS NULL;
+    AS->>US: GET /internal/users/by-oauth?provider=google&id=xxx
 
--- Журнал аутентификации
-CREATE TABLE auth_log (
-    id BIGSERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id),
-    event_type VARCHAR(20) NOT NULL,       -- login_success, login_failed, logout, token_refresh
-    ip_address INET,
-    user_agent TEXT,
-    metadata JSONB,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+    alt Пользователь существует
+        US-->>AS: User record
+    else Новый пользователь
+        AS->>US: POST /internal/users {email, name, oauth_provider: "google"}
+        US-->>AS: New user created
+    end
 
-CREATE INDEX idx_auth_log_user ON auth_log (user_id, created_at DESC);
-```
-
-### Redis структуры
-
-```
-# Refresh токены
-refresh:{user_id}:{token_id}
-  HASH
-  created_at: timestamp
-  device: "Chrome on Windows"
-  ip: "192.168.1.1"
-  TTL: 604800 (7 дней)
-
-# Blacklist (отозванные токены)
-token_blacklist:{jti}
-  value: 1
-  TTL: до истечения токена
-
-# Rate limiting для login
-auth_rate:{ip}
-  count: 5
-  TTL: 300 (5 минут)
+    AS->>AS: Generate JWT tokens
+    AS-->>B: Redirect → /dashboard?token=xxx
 ```
 
 ---
@@ -566,465 +544,197 @@ auth_rate:{ip}
 
 ### Обзор
 
-**Ответственность:** Управление пользователями, организациями, ролями и правами
+| Параметр | Значение |
+|----------|----------|
+| **Ответственность** | Пользователи, организации, роли, RBAC |
+| **Порт** | 8091 |
+| **Роли** | admin, manager, operator, viewer |
 
-**Порт:** 8083
+### Предустановленные роли
 
-### Архитектура сервиса
+| Роль | Permissions | Описание |
+|------|-------------|----------|
+| **admin** | `["*"]` | Полный доступ ко всему |
+| **manager** | `["devices.*", "geozones.*", "reports.*", "users.read"]` | Управление кроме других пользователей |
+| **operator** | `["devices.read", "commands.send", "geozones.read"]` | Мониторинг + отправка команд |
+| **viewer** | `["devices.read", "geozones.read"]` | Только просмотр |
+
+### Архитектура
 
 ```mermaid
 flowchart TB
-    subgraph Clients["Клиенты"]
-        AG[API Gateway]
-        Admin[Admin Panel]
+    subgraph API["REST API"]
+        Users["/api/v1/users"]
+        Orgs["/api/v1/organizations"]
+        Roles["/api/v1/roles"]
+        Invites["/api/v1/invites"]
+        Me["/api/v1/users/me"]
     end
 
-    subgraph US["User Service"]
-        UserCtrl[User Controller]
-        OrgCtrl[Org Controller]
-        RoleCtrl[Role Controller]
-        InviteCtrl[Invite Controller]
+    subgraph Service["Service Layer"]
+        UserSvc["UserService"]
+        OrgSvc["OrgService"]
+        PermSvc["PermissionService"]
+        InviteSvc["InviteService"]
     end
 
-    subgraph Services["Внутренние сервисы"]
-        UserSvc[User Service]
-        OrgSvc[Org Service]
-        PermSvc[Permission Service]
+    subgraph Repo["Repository Layer"]
+        UserRepo["UserRepository\n(Doobie)"]
+        OrgRepo["OrgRepository"]
+        RoleRepo["RoleRepository"]
     end
 
-    subgraph Storage["Хранилища"]
-        PG[(PostgreSQL)]
-        Redis[(Redis\ncache)]
+    subgraph DB["PostgreSQL"]
+        UsersT[("users")]
+        OrgsT[("organizations")]
+        RolesT[("roles")]
+        InvT[("user_invitations")]
     end
 
-    AG & Admin --> UserCtrl & OrgCtrl & RoleCtrl & InviteCtrl
-    UserCtrl --> UserSvc --> PG
-    OrgCtrl --> OrgSvc --> PG
-    RoleCtrl --> PermSvc --> PG
-    InviteCtrl --> UserSvc
-    UserSvc & OrgSvc & PermSvc --> Redis
-```
-
-### REST API
-
-```yaml
-# Users
-GET    /api/v1/users                      # Список пользователей (admin)
-GET    /api/v1/users/{id}                 # Один пользователь
-POST   /api/v1/users                      # Создать пользователя (admin)
-PUT    /api/v1/users/{id}                 # Обновить пользователя
-DELETE /api/v1/users/{id}                 # Удалить пользователя (soft)
-
-# Current user
-GET    /api/v1/users/me                   # Текущий пользователь
-PUT    /api/v1/users/me                   # Обновить профиль
-PUT    /api/v1/users/me/password          # Сменить пароль
-PUT    /api/v1/users/me/settings          # Обновить настройки
-
-# Organizations
-GET    /api/v1/organizations              # Список организаций (superadmin)
-GET    /api/v1/organizations/{id}         # Одна организация
-POST   /api/v1/organizations              # Создать организацию
-PUT    /api/v1/organizations/{id}         # Обновить организацию
-DELETE /api/v1/organizations/{id}         # Удалить организацию (soft)
-
-# Roles & Permissions
-GET    /api/v1/roles                      # Список ролей
-GET    /api/v1/roles/{id}/permissions     # Права роли
-PUT    /api/v1/users/{id}/role            # Назначить роль
-
-# Invitations
-POST   /api/v1/invites                    # Пригласить пользователя
-GET    /api/v1/invites/{token}            # Проверить приглашение
-POST   /api/v1/invites/{token}/accept     # Принять приглашение
-```
-
-### Модель ролей и прав
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         RBAC (Role-Based Access Control)                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Роли:                                                                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
-│  │   Admin     │  │  Manager    │  │  Operator   │  │   Viewer    │        │
-│  │  (полный)   │  │ (настройки) │  │ (команды)   │  │ (только чт.)│        │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘        │
-│                                                                             │
-│  Права (permissions):                                                       │
-│  • devices.read        • geozones.read       • reports.read                │
-│  • devices.write       • geozones.write      • reports.create              │
-│  • devices.delete      • geozones.delete     • reports.delete              │
-│  • commands.send       • notifications.read  • users.read                  │
-│  • commands.view       • notifications.write • users.write                 │
-│                                                                             │
-│  Ограничения:                                                               │
-│  • device_ids[]        — доступ к конкретным устройствам                   │
-│  • geozone_ids[]       — доступ к конкретным геозонам                      │
-│  • org_id              — принадлежность к организации                      │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### PostgreSQL схема
-
-```sql
--- Расширенная таблица users
-CREATE TABLE users (
-    id SERIAL PRIMARY KEY,
-    organization_id INTEGER NOT NULL REFERENCES organizations(id),
-    
-    -- Аутентификация
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255),            -- NULL для OAuth users
-    
-    -- Профиль
-    name VARCHAR(100),
-    phone VARCHAR(20),
-    avatar_url TEXT,
-    timezone VARCHAR(50) DEFAULT 'Europe/Moscow',
-    language VARCHAR(5) DEFAULT 'ru',
-    
-    -- Авторизация
-    role_id INTEGER REFERENCES roles(id),
-    custom_permissions JSONB DEFAULT '[]',  -- дополнительные права
-    
-    -- Ограничения доступа
-    allowed_device_ids INTEGER[],           -- NULL = все устройства org
-    allowed_geozone_ids INTEGER[],          -- NULL = все геозоны org
-    
-    -- Настройки уведомлений
-    notification_settings JSONB DEFAULT '{}',
-    -- {"email": true, "push": true, "sms": false}
-    
-    -- Статус
-    is_active BOOLEAN DEFAULT true,
-    email_verified BOOLEAN DEFAULT false,
-    last_login_at TIMESTAMPTZ,
-    
-    -- OAuth
-    oauth_provider VARCHAR(20),             -- google, yandex
-    oauth_id VARCHAR(100),
-    
-    -- Timestamps
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ                  -- soft delete
-);
-
--- Роли
-CREATE TABLE roles (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(50) NOT NULL,              -- admin, manager, operator, viewer
-    display_name VARCHAR(100),              -- "Администратор", "Оператор"
-    permissions JSONB NOT NULL DEFAULT '[]',
-    is_system BOOLEAN DEFAULT false,        -- системные роли нельзя удалить
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Предустановленные роли
-INSERT INTO roles (name, display_name, permissions, is_system) VALUES
-('admin', 'Администратор', '["*"]', true),
-('manager', 'Менеджер', '["devices.*", "geozones.*", "reports.*", "users.read"]', true),
-('operator', 'Оператор', '["devices.read", "commands.send", "geozones.read"]', true),
-('viewer', 'Наблюдатель', '["devices.read", "geozones.read"]', true);
-
--- Приглашения
-CREATE TABLE user_invitations (
-    id SERIAL PRIMARY KEY,
-    organization_id INTEGER REFERENCES organizations(id),
-    email VARCHAR(255) NOT NULL,
-    role_id INTEGER REFERENCES roles(id),
-    token VARCHAR(100) UNIQUE NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    accepted_at TIMESTAMPTZ,
-    created_by INTEGER REFERENCES users(id),
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_invitations_token ON user_invitations (token) WHERE accepted_at IS NULL;
-
--- Расширенная таблица organizations
-CREATE TABLE organizations (
-    id SERIAL PRIMARY KEY,
-    
-    -- Основное
-    name VARCHAR(100) NOT NULL,
-    legal_name VARCHAR(200),
-    
-    -- Подписка
-    subscription_type VARCHAR(20) DEFAULT 'trial',
-    subscription_expires_at TIMESTAMPTZ,
-    max_devices INTEGER DEFAULT 10,
-    max_users INTEGER DEFAULT 5,
-    max_geozones INTEGER DEFAULT 50,
-    
-    -- Настройки
-    settings JSONB DEFAULT '{}',
-    -- {
-    --   "timezone": "Europe/Moscow",
-    --   "date_format": "DD.MM.YYYY",
-    --   "speed_unit": "kmh",
-    --   "fuel_unit": "liters"
-    -- }
-    
-    -- Брендинг
-    logo_url TEXT,
-    primary_color VARCHAR(7),
-    
-    -- Контакты
-    contact_email VARCHAR(255),
-    contact_phone VARCHAR(20),
-    address TEXT,
-    
-    -- Статус
-    is_active BOOLEAN DEFAULT true,
-    
-    -- Timestamps
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
-### Prometheus метрики
-
-```
-# Users
-user_service_operations_total{operation="create"} 150
-user_service_operations_total{operation="update"} 3500
-user_service_operations_total{operation="delete"} 45
-
-# Organizations
-org_service_organizations_total 120
-org_service_users_per_org{org_id="1"} 15
-
-# Invitations
-user_service_invitations_sent_total 500
-user_service_invitations_accepted_total 420
+    Users & Me --> UserSvc --> UserRepo --> UsersT
+    Orgs --> OrgSvc --> OrgRepo --> OrgsT
+    Roles --> PermSvc --> RoleRepo --> RolesT
+    Invites --> InviteSvc --> UserRepo & RoleRepo
+    InviteSvc --> InvT
 ```
 
 ---
 
-## �🔌 WebSocket Service
+## 🔌 WebSocket Service
 
 ### Обзор
 
-**Ответственность:** Real-time обновления позиций, событий, команд
+| Параметр | Значение |
+|----------|----------|
+| **Ответственность** | Real-time позиции, события, алерты |
+| **Порт** | 8081 |
+| **Источники** | Kafka (gps-events), Redis Pub/Sub |
+| **Rooms** | org:{id}, device:{id}, alerts:{id} |
 
-**Порт:** 8081
-
-### Архитектура сервиса
+### Архитектура
 
 ```mermaid
 flowchart TB
     subgraph Clients["Клиенты"]
-        WS1[Browser 1]
-        WS2[Browser 2]
-        WS3[Mobile App]
+        B1["Browser 1\n(org:123)"]
+        B2["Browser 2\n(device:456)"]
+        M["Mobile\n(alerts:123)"]
     end
 
-    subgraph WSService["WebSocket Service"]
-        Upgrader[HTTP → WS Upgrader]
-        Auth[Token Validator]
-        ConnManager[Connection Manager]
-        RoomManager[Room Manager]
-        MessageHandler[Message Handler]
+    subgraph WS["WebSocket Service"]
+        Upgrader["HTTP → WS Upgrader"]
+        AuthWS["JWT Validator\n(from query param)"]
+        ConnMgr["Connection Manager"]
+        
+        subgraph Rooms["Room Manager"]
+            OrgRoom["org:{org_id}"]
+            DevRoom["device:{device_id}"]
+            AlertRoom["alerts:{org_id}"]
+        end
+
+        MsgHandler["Message Handler\n(serialize → JSON)"]
     end
 
-    subgraph Rooms["Rooms (каналы)"]
-        OrgRoom[org:{org_id}\nВсе устройства орг.]
-        DevRoom[device:{device_id}\nКонкретное устройство]
-        AlertRoom[alerts:{org_id}\nАлерты организации]
+    subgraph Sources["Источники событий"]
+        KafkaGPS["Kafka:\ngps-events"]
+        KafkaEvents["Kafka:\ngeozone-events\nspeed-events\nsensor-events"]
+        RedisPub["Redis Pub/Sub:\ncmd-response:{imei}\nconnection-status"]
     end
 
-    subgraph Sources["Источники данных"]
-        Kafka[(Kafka)]
-        Redis[(Redis Pub/Sub)]
-    end
-
-    WS1 & WS2 & WS3 --> Upgrader --> Auth --> ConnManager
-    ConnManager --> RoomManager
-    RoomManager --> OrgRoom & DevRoom & AlertRoom
+    B1 & B2 & M -->|ws://| Upgrader --> AuthWS --> ConnMgr --> Rooms
     
-    Kafka --> MessageHandler
-    Redis --> MessageHandler
-    MessageHandler --> RoomManager
+    KafkaGPS --> MsgHandler
+    KafkaEvents --> MsgHandler
+    RedisPub --> MsgHandler
+    
+    MsgHandler --> |broadcast| Rooms --> Clients
 ```
 
-### Протокол сообщений
-
-#### Подключение и подписка
-
-```json
-// 1. Подключение
-ws://tracker.local:8081/ws?token=JWT_TOKEN
-
-// 2. Подписка на организацию (все устройства)
-{
-  "type": "subscribe",
-  "channel": "org:123"
-}
-
-// 3. Подписка на конкретное устройство
-{
-  "type": "subscribe", 
-  "channel": "device:456"
-}
-
-// 4. Подписка на алерты
-{
-  "type": "subscribe",
-  "channel": "alerts:123"
-}
-
-// 5. Отписка
-{
-  "type": "unsubscribe",
-  "channel": "device:456"
-}
-```
-
-#### Исходящие сообщения (Server → Client)
-
-```json
-// Обновление позиции
-{
-  "type": "position",
-  "device_id": 456,
-  "data": {
-    "lat": 55.7558,
-    "lon": 37.6173,
-    "speed": 45,
-    "course": 180,
-    "timestamp": "2026-01-26T12:00:00Z"
-  }
-}
-
-// Событие геозоны
-{
-  "type": "geozone_event",
-  "device_id": 456,
-  "data": {
-    "event": "enter",
-    "geozone_id": 789,
-    "geozone_name": "Офис",
-    "timestamp": "2026-01-26T12:00:00Z"
-  }
-}
-
-// Алерт
-{
-  "type": "alert",
-  "device_id": 456,
-  "data": {
-    "alert_type": "speed_exceed",
-    "value": 120,
-    "threshold": 90,
-    "timestamp": "2026-01-26T12:00:00Z"
-  }
-}
-
-// Статус подключения устройства
-{
-  "type": "connection_status",
-  "device_id": 456,
-  "data": {
-    "status": "online",
-    "protocol": "teltonika",
-    "connected_at": "2026-01-26T11:55:00Z"
-  }
-}
-
-// Ответ на команду
-{
-  "type": "command_response",
-  "device_id": 456,
-  "data": {
-    "command_id": 999,
-    "status": "executed",
-    "response": "OK"
-  }
-}
-```
-
-### Sequence Diagram: Real-time позиции
+### Sequence Diagram: Real-time позиции до браузера
 
 ```mermaid
 sequenceDiagram
-    participant T as Трекер
+    participant T as 🛰️ Трекер
     participant CM as Connection Manager
     participant K as Kafka
     participant WS as WebSocket Service
     participant R as Redis
-    participant B as Browser
+    participant B as 🌐 Browser
 
-    B->>WS: Connect (JWT)
-    WS->>WS: Validate token
-    WS->>R: GET user:{user_id}:org
-    R-->>WS: org_id = 123
-    WS-->>B: Connected
+    Note over B,WS: Инициализация подписки
 
-    B->>WS: Subscribe org:123
-    WS->>WS: Add to room "org:123"
-    WS-->>B: Subscribed
+    B->>WS: ws://host:8081/ws?token=JWT
+    WS->>WS: Validate JWT → user_id=42, org_id=123
+    WS-->>B: Connected ✓
 
-    Note over T,B: GPS данные
+    B->>WS: {"type":"subscribe","channel":"org:123"}
+    WS->>WS: Add connection to room org:123
+    WS-->>B: {"type":"subscribed","channel":"org:123"}
 
-    T->>CM: GPS packet
-    CM->>K: Publish gps-events
-    CM->>R: SET pos:{imei}
+    Note over T,B: GPS данные в реальном времени
+
+    T->>CM: TCP: GPS пакет (IMEI 352093089439473)
+    CM->>CM: Parse → filter → enrich
+    CM->>K: Publish gps-events {device_id:456, lat:55.75, lon:37.62, speed:45}
+    CM->>R: SET pos:352093089439473 {lat,lon,speed,ts}
 
     K->>WS: Consume gps-events
-    WS->>WS: Find subscribers for device
-    WS->>B: Position update (JSON)
+    WS->>WS: device_id=456 → org_id=123 → room "org:123"
 
-    Note over WS,B: Broadcast всем в room
+    WS->>B: {"type":"position","device_id":456,<br/>"data":{"lat":55.7558,"lon":37.6173,"speed":45,"course":180}}
+
+    Note over B: Обновить маркер на карте (Leaflet moveMarker)
 ```
 
-### Redis структуры
+### Протокол сообщений
+
+**Client → Server:**
+
+| type | Описание | Пример |
+|------|----------|--------|
+| `subscribe` | Подписка на канал | `{"type":"subscribe","channel":"org:123"}` |
+| `unsubscribe` | Отписка | `{"type":"unsubscribe","channel":"device:456"}` |
+| `ping` | Keep-alive | `{"type":"ping"}` |
+
+**Server → Client:**
+
+| type | Описание | Частота |
+|------|----------|---------|
+| `position` | GPS позиция | ~1-60 раз/мин на устройство |
+| `geozone_event` | Вход/выход из геозоны | По событию |
+| `alert` | Алерт (скорость, датчик) | По событию |
+| `connection_status` | Устройство online/offline | По событию |
+| `command_response` | Ответ на команду | По событию |
+| `pong` | Keep-alive ответ | По запросу |
+
+### Redis структуры для WS
 
 ```
-# Активные WS подключения (для мониторинга)
-ws:connections:{node_id}
-  HASH
-  user:{user_id}: {connected_at, subscriptions}
-
 # Подписки (для горизонтального масштабирования)
-ws:subs:org:{org_id}
-  SET of node_ids that have subscribers
+ws:subs:org:{org_id}           SET of node_ids
+ws:subs:device:{device_id}     SET of node_ids
 
-ws:subs:device:{device_id}
-  SET of node_ids that have subscribers
+# Pub/Sub каналы для кросс-нод broadcast
+SUBSCRIBE ws:broadcast:org:{org_id}
+SUBSCRIBE ws:broadcast:device:{device_id}
 
-# Pub/Sub каналы для кросс-ноды broadcast
-ws:broadcast:org:{org_id}
-ws:broadcast:device:{device_id}
-ws:broadcast:alerts:{org_id}
+# Мониторинг подключений
+ws:connections:{node_id}       HASH {user_id → metadata}
 ```
 
-### Prometheus метрики
+---
 
-```
-# Connections
-ws_connections_active 1500
-ws_connections_total 25000
-ws_disconnections_total 23500
+## 🛡️ Admin Service (Block 3)
 
-# Subscriptions
-ws_subscriptions_active{channel_type="org"} 1200
-ws_subscriptions_active{channel_type="device"} 300
-ws_subscriptions_active{channel_type="alerts"} 500
+> Admin Service также описан в [ARCHITECTURE_BLOCK2.md](./ARCHITECTURE_BLOCK2.md) (системный мониторинг).  
+> Здесь — его UI-facing часть для Block 3.
 
-# Messages
-ws_messages_sent_total{type="position"} 5000000
-ws_messages_sent_total{type="geozone_event"} 15000
-ws_messages_sent_total{type="alert"} 3000
+### Функции
 
-# Latency (Kafka → Client)
-ws_broadcast_latency_ms{quantile="0.5"} 15
-ws_broadcast_latency_ms{quantile="0.99"} 50
-```
+- **System Dashboard** — статус всех сервисов, Kafka lag, Redis stats
+- **Feature Flags** — вкл/выкл функциональности динамически
+- **Audit Log** — журнал всех действий пользователей
+- **Config** — настройки системы без перезапуска
 
 ---
 
@@ -1032,441 +742,545 @@ ws_broadcast_latency_ms{quantile="0.99"} 50
 
 ### Обзор
 
-**Ответственность:** Веб-интерфейс для мониторинга и управления
+| Параметр | Значение |
+|----------|----------|
+| **Фреймворк** | React 19 + TypeScript 5.9 |
+| **Карта** | Leaflet + React-Leaflet |
+| **Data Fetching** | TanStack Query v5 |
+| **State** | Zustand |
+| **Сборка** | Vite 7.2.4 |
+| **Стили** | Tailwind CSS 4 |
 
-**Технологии:**
-- React 18
-- TypeScript
-- Leaflet (карта)
-- TanStack Query (data fetching)
-- Zustand (state management)
-- Tailwind CSS
-
-### Архитектура приложения
+### Архитектура Frontend
 
 ```mermaid
 flowchart TB
     subgraph App["React Application"]
-        Router[React Router]
+        Router["React Router v7"]
         
-        subgraph Pages["Страницы"]
-            MapPage[Map Page]
-            DevicesPage[Devices Page]
-            GeozonesPage[Geozones Page]
-            ReportsPage[Reports Page]
-            SettingsPage[Settings]
+        subgraph Pages["Pages"]
+            MapPage["🗺️ MapPage\n(главный экран)"]
+            DevicesPage["📋 DevicesPage"]
+            GeozonesPage["📍 GeozonesPage"]
+            ReportsPage["📊 ReportsPage"]
+            SettingsPage["⚙️ SettingsPage"]
         end
-        
-        subgraph Components["Компоненты"]
-            Map[Leaflet Map]
-            DeviceList[Device List]
-            DeviceCard[Device Card]
-            TrackPlayer[Track Player]
-            GeozoneEditor[Geozone Editor]
+
+        subgraph Components["Key Components"]
+            LeafletMap["Leaflet Map\n(markers, tracks, zones)"]
+            DeviceList["Device List\n(sidebar)"]
+            TrackPlayer["Track Player\n(timeline animation)"]
+            GeoEditor["Geozone Editor\n(draw polygon/circle)"]
+            AlertFeed["Alert Feed\n(real-time)"]
         end
-        
-        subgraph State["State Management"]
-            Query[TanStack Query]
-            Store[Zustand Store]
-            WSClient[WebSocket Client]
+
+        subgraph StateLayer["State Layer"]
+            TanStack["TanStack Query\n(server state cache)"]
+            Zustand["Zustand Stores\n(UI state)"]
+            WSHook["useWebSocket\n(real-time updates)"]
         end
-        
-        subgraph API["API Layer"]
-            RestClient[REST Client]
-            WSAdapter[WS Adapter]
+
+        subgraph ApiLayer["API Layer"]
+            RestClient["REST Client\n(fetch → API Gateway)"]
+            WSClient["WebSocket Client\n(ws → WS Service)"]
         end
     end
 
     subgraph Backend["Backend"]
-        APIGateway[API Gateway :8080]
-        WSService[WebSocket :8081]
+        GW["API Gateway :8080"]
+        WS["WebSocket :8081"]
     end
 
-    Router --> MapPage & DevicesPage & GeozonesPage & ReportsPage & SettingsPage
-    MapPage --> Map & DeviceList
-    Map --> DeviceCard & TrackPlayer & GeozoneEditor
+    Router --> Pages
+    MapPage --> LeafletMap & DeviceList & TrackPlayer & GeoEditor & AlertFeed
     
-    Query --> RestClient --> APIGateway
-    WSClient --> WSAdapter --> WSService
-    Store --> Query & WSClient
+    TanStack --> RestClient --> GW
+    WSHook --> WSClient --> WS
+    Zustand --> TanStack & WSHook
 ```
 
-### Основные экраны
-
-#### 1. Карта (главный экран)
+### Основной экран: Карта
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  TrackerGPS    [Поиск устройства...]        🔔 3  👤 Admin   ⚙️            │
+│  TrackerGPS    [🔍 Поиск устройства...]         🔔 3  👤 Admin   ⚙️        │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────┐  ┌───────────────────────────────────────────────────┐   │
-│  │ 📋 Устройства │  │                                                   │   │
-│  │              │  │                      🗺️ КАРТА                      │   │
-│  │ 🟢 Газель-1  │  │                                                   │   │
-│  │    45 км/ч   │  │          🚗                                       │   │
-│  │              │  │                                                   │   │
-│  │ 🟢 Фура-12   │  │                    🚛                             │   │
-│  │    62 км/ч   │  │                                                   │   │
-│  │              │  │      ┌─────────┐                                  │   │
-│  │ 🔴 Кран-3    │  │      │ Офис    │  (геозона)                       │   │
-│  │    Offline   │  │      └─────────┘                                  │   │
-│  │              │  │                                                   │   │
-│  │ 🟡 БМВ-007   │  │                         🚗                        │   │
-│  │    Стоит     │  │                                                   │   │
-│  │              │  │                                                   │   │
-│  │ [+ Добавить] │  │  ─ ─ ─ (трек)                                     │   │
-│  │              │  │                                                   │   │
-│  └──────────────┘  └───────────────────────────────────────────────────┘   │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────────┤
-│  │ 🚗 Газель-1 | IMEI: 123456789 | 55.755, 37.617 | 45 км/ч | 12:45:30   │
-│  └─────────────────────────────────────────────────────────────────────────┘
+│ 🗺️ Карта │ 📋 Устройства │ 📍 Геозоны │ 📊 Отчёты │ ⚙️ Настройки          │
+├──────────────┬──────────────────────────────────────────────────────────────┤
+│              │                                                              │
+│ 📋 Устрой-  │                    🗺️ LEAFLET MAP                            │
+│    ства      │                                                              │
+│              │          🚗 Газель-1 (45 км/ч)                               │
+│ 🟢 Газель-1  │                                                              │
+│    45 км/ч   │                    🚛 Фура-12 (62 км/ч)                      │
+│ 🟢 Фура-12   │                                                              │
+│    62 км/ч   │      ┌─────────┐                                             │
+│ 🔴 Кран-3    │      │ Офис    │  (геозона, полигон)                         │
+│    Offline   │      └─────────┘                                             │
+│ 🟡 БМВ-007   │                         🚗 БМВ-007 (стоит)                   │
+│    Стоит     │                                                              │
+│              │                                                              │
+│ [+ Добавить] │  - - - (трек Газели за сегодня)                              │
+│              │                                                              │
+├──────────────┴──────────────────────────────────────────────────────────────┤
+│ 🚗 Газель-1 │ IMEI: 352093089439473 │ 55.755, 37.617 │ 45 км/ч │ 12:45:30 │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 2. Трек устройства
+### Экран: Track Player
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  ← Назад    Трек: Газель-1    [26.01.2026] [08:00] - [18:00]    [Показать] │
+│  ← Назад     Трек: Газель-1    📅 [06.03.2026] ⏰ [08:00] - [18:00] [▶]   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                                                                     │   │
-│  │           🚗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━🚗                 │   │
-│  │          Start                                  End                │   │
-│  │                                                                     │   │
-│  │     A ─────────────────────────────────────────── B                │   │
-│  │    (08:00)                                      (17:45)             │   │
-│  │                                                                     │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
+│                            🗺️ MAP + TRACK                                  │
 │                                                                             │
-│  ◄ ▶️ ║ ═══════════●═══════════════════════════════════ │ 1x 2x 5x        │
-│       08:00        10:00     12:00     14:00     16:00  17:45             │
+│     A ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ B                      │
+│   (start)              🚗 (current)              (end)                      │
 │                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────────┤
-│  │ Пробег: 156 км | Время в пути: 8ч 15м | Макс. скорость: 95 км/ч       │
-│  │ Остановок: 5 | В геозонах: Офис (2ч), Склад (45м)                     │
-│  └─────────────────────────────────────────────────────────────────────────┘
+│  ◄◄  ▶️  ►►  ═══════════●═══════════════════════  │ 1x 2x 5x 10x          │
+│           08:00     10:30      12:00     14:00     16:00    17:45           │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Пробег: 156 км │ Время в пути: 8ч 15м │ Макс: 95 км/ч │ Стоянок: 5      │
+│  Геозоны: Офис (2ч 10м), Склад (45м) │ Средняя скорость: 42 км/ч         │
 └─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Компонент: Map (Leaflet)
-
-```typescript
-// Упрощённая структура
-interface MapProps {
-  devices: Device[];
-  geozones: Geozone[];
-  selectedDevice?: Device;
-  track?: GpsPoint[];
-  onDeviceClick: (device: Device) => void;
-  onGeozoneClick: (geozone: Geozone) => void;
-}
-
-// Слои карты
-const mapLayers = {
-  base: 'OpenStreetMap',      // базовая карта
-  devices: 'DeviceMarkers',   // маркеры устройств
-  geozones: 'GeozonePolygons', // полигоны геозон
-  track: 'TrackPolyline',     // трек устройства
-  clusters: 'DeviceClusters'  // кластеризация (много устройств)
-};
-```
-
-### WebSocket Client
-
-```typescript
-// Упрощённая структура
-class TrackerWebSocket {
-  private ws: WebSocket;
-  private subscriptions: Set<string> = new Set();
-  
-  connect(token: string): void;
-  subscribe(channel: string): void;
-  unsubscribe(channel: string): void;
-  
-  onPosition(callback: (data: PositionUpdate) => void): void;
-  onGeozoneEvent(callback: (data: GeozoneEvent) => void): void;
-  onAlert(callback: (data: Alert) => void): void;
-  onConnectionStatus(callback: (data: ConnectionStatus) => void): void;
-}
-
-// Использование
-const ws = new TrackerWebSocket();
-ws.connect(authToken);
-ws.subscribe(`org:${organizationId}`);
-
-ws.onPosition((update) => {
-  // Обновить маркер на карте
-  mapStore.updateDevicePosition(update.device_id, update.data);
-});
 ```
 
 ### Структура проекта
 
 ```
-web-frontend/
-├── src/
-│   ├── api/
-│   │   ├── client.ts           # Axios instance
-│   │   ├── devices.ts          # Device API
-│   │   ├── geozones.ts         # Geozone API
-│   │   └── reports.ts          # Reports API
-│   │
-│   ├── components/
-│   │   ├── map/
-│   │   │   ├── Map.tsx
-│   │   │   ├── DeviceMarker.tsx
-│   │   │   ├── GeozoneLayer.tsx
-│   │   │   ├── TrackLayer.tsx
-│   │   │   └── TrackPlayer.tsx
-│   │   │
-│   │   ├── devices/
-│   │   │   ├── DeviceList.tsx
-│   │   │   ├── DeviceCard.tsx
-│   │   │   └── DeviceForm.tsx
-│   │   │
-│   │   ├── geozones/
-│   │   │   ├── GeozoneList.tsx
-│   │   │   ├── GeozoneEditor.tsx
-│   │   │   └── GeozoneDrawer.tsx
-│   │   │
-│   │   └── common/
-│   │       ├── Header.tsx
-│   │       ├── Sidebar.tsx
-│   │       └── ...
-│   │
-│   ├── pages/
-│   │   ├── MapPage.tsx
-│   │   ├── DevicesPage.tsx
-│   │   ├── GeozonesPage.tsx
-│   │   ├── ReportsPage.tsx
-│   │   └── SettingsPage.tsx
-│   │
-│   ├── store/
-│   │   ├── authStore.ts
-│   │   ├── devicesStore.ts
-│   │   └── mapStore.ts
-│   │
-│   ├── hooks/
-│   │   ├── useDevices.ts
-│   │   ├── useTrack.ts
-│   │   ├── useWebSocket.ts
-│   │   └── ...
-│   │
-│   ├── types/
-│   │   ├── device.ts
-│   │   ├── geozone.ts
-│   │   └── ...
-│   │
-│   ├── utils/
-│   │   ├── geo.ts              # Геометрические утилиты
-│   │   ├── format.ts           # Форматирование
-│   │   └── ...
-│   │
-│   ├── App.tsx
-│   └── main.tsx
-│
-├── public/
-├── package.json
-├── tsconfig.json
-├── vite.config.ts
-└── tailwind.config.js
+web-frontend/src/
+├── api/
+│   ├── client.ts                # fetch wrapper + interceptors
+│   ├── devices.ts               # Device API hooks
+│   ├── geozones.ts              # Geozone API hooks
+│   ├── reports.ts               # Reports API hooks
+│   └── auth.ts                  # Auth API hooks
+├── components/
+│   ├── map/
+│   │   ├── Map.tsx              # Leaflet container
+│   │   ├── DeviceMarker.tsx     # Маркер устройства (анимация движения)
+│   │   ├── GeozoneLayer.tsx     # Полигоны/круги геозон
+│   │   ├── TrackLayer.tsx       # Polyline трека
+│   │   └── TrackPlayer.tsx      # Плеер временной шкалы
+│   ├── devices/
+│   │   ├── DeviceList.tsx       # Боковая панель
+│   │   ├── DeviceCard.tsx       # Карточка устройства
+│   │   └── DeviceForm.tsx       # Форма создания/редактирования
+│   ├── geozones/
+│   │   ├── GeozoneEditor.tsx    # Рисование на карте
+│   │   └── GeozoneList.tsx      # Список геозон
+│   └── common/
+│       ├── Header.tsx
+│       ├── Sidebar.tsx
+│       └── AlertBadge.tsx
+├── pages/
+│   ├── MapPage.tsx
+│   ├── DevicesPage.tsx
+│   ├── GeozonesPage.tsx
+│   ├── ReportsPage.tsx
+│   └── SettingsPage.tsx
+├── store/
+│   ├── authStore.ts             # JWT tokens, user
+│   ├── devicesStore.ts          # Устройства + real-time позиции
+│   └── mapStore.ts              # Viewport, selected device
+├── hooks/
+│   ├── useDevices.ts            # TanStack Query: devices
+│   ├── useTrack.ts              # TanStack Query: track history
+│   ├── useWebSocket.ts          # WS connection + auto-reconnect
+│   └── useGeozones.ts           # TanStack Query: geozones
+├── types/
+│   ├── device.ts
+│   ├── geozone.ts
+│   ├── ws.ts
+│   └── api.ts
+├── utils/
+│   ├── geo.ts                   # Haversine, bearing, etc.
+│   ├── format.ts                # Дата, скорость, координаты
+│   └── wsReconnect.ts           # Exponential backoff WS reconnect
+├── App.tsx
+└── main.tsx
 ```
 
 ---
 
-## 🔗 Взаимодействие сервисов Block 3
+## 🔄 State Diagrams
+
+### WebSocket Connection Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Disconnected
+
+    Disconnected --> Connecting : User opens page
+    Connecting --> Connected : WS handshake OK
+    Connecting --> Reconnecting : Handshake failed
+
+    Connected --> Subscribing : Send subscribe messages
+    Subscribing --> Active : Subscriptions confirmed
+    
+    Active --> Active : Receiving messages
+    Active --> Reconnecting : Connection lost
+    
+    Reconnecting --> Connecting : Backoff timer (1s, 2s, 4s, 8s...)
+    Reconnecting --> Disconnected : Max retries (10) exceeded
+
+    Active --> Disconnected : User navigates away
+    Connected --> Disconnected : User logs out
+
+    note right of Active
+        Автоматически обновляем
+        маркеры на карте,
+        алерт-бейджи, списки
+    end note
+
+    note right of Reconnecting
+        Exponential backoff:
+        1s → 2s → 4s → 8s → 16s → 30s(max)
+        Показываем banner "Переподключение..."
+    end note
+```
+
+### JWT Token Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoToken : Первый визит
+
+    NoToken --> Authenticating : User submits login
+    Authenticating --> HasTokens : Login success
+    Authenticating --> NoToken : Login failed
+
+    HasTokens --> Active : access_token valid
+    Active --> Active : API requests OK
+
+    Active --> Refreshing : access_token expired (401)
+    Refreshing --> Active : Refresh success → new access_token
+    Refreshing --> NoToken : Refresh failed → redirect to login
+
+    Active --> NoToken : User clicks logout
+    Active --> NoToken : refresh_token expired (7 days)
+
+    note right of Active
+        access_token: 15 min
+        Stored in memory (Zustand)
+    end note
+
+    note right of HasTokens
+        refresh_token: 7 days
+        Stored in HttpOnly cookie
+    end note
+```
+
+---
+
+## 🔗 Взаимодействие всех сервисов Block 3
 
 ```mermaid
 sequenceDiagram
-    participant B as Browser
-    participant AG as API Gateway
-    participant WS as WebSocket Service
+    participant B as 🌐 Browser
+    participant GW as API Gateway :8080
+    participant AS as Auth :8082
+    participant US as User :8091
+    participant WS as WebSocket :8081
     participant DM as Device Manager
     participant DB as PostgreSQL
     participant R as Redis
     participant K as Kafka
     participant CM as Connection Manager
 
-    Note over B,CM: Инициализация сессии
+    Note over B,CM: 1. Аутентификация
 
-    B->>AG: POST /auth/login
-    AG->>DB: Verify credentials
-    AG-->>B: JWT token
+    B->>GW: POST /auth/login {email, password}
+    GW->>AS: Forward
+    AS->>US: Verify user by email
+    US->>DB: SELECT user
+    DB-->>US: User record
+    US-->>AS: User data
+    AS->>AS: BCrypt verify + generate JWT
+    AS->>R: Store refresh session
+    AS-->>B: {access_token, refresh_token}
 
-    B->>AG: GET /api/v1/devices
-    AG->>DM: Get devices
-    DM->>DB: SELECT devices
+    Note over B,CM: 2. Загрузка данных
+
+    B->>GW: GET /api/v1/devices (Bearer token)
+    GW->>GW: Validate JWT + check permissions
+    GW->>DM: Get devices (org_id=123)
+    DM->>DB: SELECT devices WHERE org_id=123
     DB-->>DM: [devices]
-    DM-->>AG: [devices]
-    AG-->>B: {devices: [...]}
+    DM-->>GW: [devices]
+    GW-->>B: {devices: [...]}
 
-    B->>WS: Connect (JWT)
-    WS->>WS: Validate
+    Note over B,CM: 3. WebSocket подписка
+
+    B->>WS: ws://host:8081/ws?token=JWT
+    WS->>WS: Validate JWT → org_id=123
     WS-->>B: Connected
 
-    B->>WS: Subscribe org:123
-    WS-->>B: Subscribed
+    B->>WS: {"type":"subscribe","channel":"org:123"}
+    WS-->>B: {"type":"subscribed"}
 
-    Note over B,CM: Real-time поток
+    Note over B,CM: 4. Real-time поток
 
-    CM->>K: GPS point
+    CM->>K: gps-events {device:456, lat:55.75, speed:45}
     K->>WS: Consume
-    WS->>B: Position update
+    WS->>B: {"type":"position","device_id":456,"data":{...}}
 
-    Note over B,CM: Отправка команды
+    Note over B,CM: 5. Отправка команды
 
-    B->>AG: POST /devices/456/commands {type: "reboot"}
-    AG->>DM: Send command
-    DM->>R: PUBLISH cmd:{imei}
-    R-->>CM: Command
-    CM->>CM: Send to tracker
-    CM->>R: PUBLISH cmd-response:{imei}
-    R-->>WS: Response
-    WS->>B: Command response
+    B->>GW: POST /api/v1/devices/456/commands {type:"getPosition"}
+    GW->>DM: Send command
+    DM->>R: RPUSH cmd:352093089439473 {command}
+    R-->>CM: Receive command
+    CM->>CM: Send to tracker via TCP
+
+    CM->>R: PUBLISH cmd-response:352093089439473 {result}
+    R-->>WS: Subscribe notification
+    WS->>B: {"type":"command_response","status":"executed"}
+```
+
+---
+
+## 🗄️ ER: Базы данных Block 3
+
+### Auth Service
+
+```mermaid
+erDiagram
+    refresh_tokens {
+        uuid id PK
+        int user_id FK
+        string token_hash
+        jsonb device_info
+        timestamptz expires_at
+        timestamptz revoked_at
+        timestamptz created_at
+    }
+
+    auth_log {
+        bigint id PK
+        int user_id FK
+        string event_type
+        inet ip_address
+        text user_agent
+        jsonb metadata
+        timestamptz created_at
+    }
+
+    api_keys {
+        int id PK
+        int organization_id FK
+        string key_hash UK
+        string name
+        jsonb permissions
+        int rate_limit
+        timestamptz expires_at
+        boolean is_active
+    }
+```
+
+### User Service
+
+```mermaid
+erDiagram
+    organizations {
+        int id PK
+        string name
+        string legal_name
+        string subscription_type
+        timestamptz subscription_expires_at
+        int max_devices
+        int max_users
+        jsonb settings
+        boolean is_active
+    }
+
+    users {
+        int id PK
+        int organization_id FK
+        string email UK
+        string password_hash
+        string name
+        string phone
+        int role_id FK
+        jsonb custom_permissions
+        string oauth_provider
+        string oauth_id
+        boolean is_active
+        boolean email_verified
+        timestamptz last_login_at
+    }
+
+    roles {
+        int id PK
+        string name
+        string display_name
+        jsonb permissions
+        boolean is_system
+    }
+
+    user_invitations {
+        int id PK
+        int organization_id FK
+        string email
+        int role_id FK
+        string token UK
+        timestamptz expires_at
+        timestamptz accepted_at
+        int created_by FK
+    }
+
+    organizations ||--o{ users : "employs"
+    roles ||--o{ users : "assigned"
+    organizations ||--o{ user_invitations : "creates"
+    roles ||--o{ user_invitations : "assigns"
+```
+
+---
+
+## 📡 REST API Reference
+
+### Auth Service (:8082)
+
+```yaml
+POST   /auth/login                    # Login → JWT tokens
+POST   /auth/logout                   # Logout → revoke tokens
+POST   /auth/refresh                  # Refresh access token
+POST   /auth/password/reset           # Request password reset
+POST   /auth/password/change          # Change password (auth required)
+GET    /auth/oauth/google             # Google OAuth redirect
+GET    /auth/oauth/google/callback    # Google callback
+GET    /auth/oauth/yandex             # Yandex OAuth redirect
+GET    /auth/oauth/yandex/callback    # Yandex callback
+POST   /auth/validate                 # Internal: validate token
+```
+
+### User Service (:8091)
+
+```yaml
+GET    /api/v1/users                  # List users (admin)
+GET    /api/v1/users/{id}             # Get user
+POST   /api/v1/users                  # Create user (admin)
+PUT    /api/v1/users/{id}             # Update user
+DELETE /api/v1/users/{id}             # Soft delete user
+GET    /api/v1/users/me               # Current user profile
+PUT    /api/v1/users/me               # Update profile
+PUT    /api/v1/users/me/password      # Change password
+GET    /api/v1/organizations/{id}     # Get organization
+PUT    /api/v1/organizations/{id}     # Update organization
+GET    /api/v1/roles                  # List roles
+PUT    /api/v1/users/{id}/role        # Assign role (admin)
+POST   /api/v1/invites               # Send invitation
+POST   /api/v1/invites/{token}/accept # Accept invitation
+```
+
+### API Gateway (:8080) — проксирует к backend
+
+```yaml
+# Devices (→ Device Manager)
+GET    /api/v1/devices                # List devices
+GET    /api/v1/devices/{id}           # Get device
+POST   /api/v1/devices                # Create device
+PUT    /api/v1/devices/{id}           # Update device
+DELETE /api/v1/devices/{id}           # Delete device
+GET    /api/v1/devices/{id}/position  # Last position
+GET    /api/v1/devices/{id}/track     # Track (from, to params)
+POST   /api/v1/devices/{id}/commands  # Send command
+GET    /api/v1/devices/positions      # All positions (bulk)
+
+# Geozones (→ Rule Checker)
+GET    /api/v1/geozones               # List geozones
+POST   /api/v1/geozones               # Create geozone
+PUT    /api/v1/geozones/{id}          # Update geozone
+DELETE /api/v1/geozones/{id}          # Delete geozone
+GET    /api/v1/geozones/{id}/events   # Geozone events
+
+# Reports (→ Analytics Service)
+POST   /api/v1/reports                # Generate report
+GET    /api/v1/reports/{id}           # Get report / download
+GET    /api/v1/reports                # List reports
+
+# Stats (→ Analytics Service)
+GET    /api/v1/devices/{id}/stats     # Device stats for period
+GET    /api/v1/devices/{id}/trips     # Trip list
+GET    /api/v1/devices/{id}/stops     # Stop list
 ```
 
 ---
 
 ## 📊 Сводная таблица Block 3
 
-### Основные характеристики сервисов (MVP — 6 сервисов)
-
-| Параметр | API Gateway | WebSocket | User Service | Auth Service | Admin Service | Web Frontend |
-|----------|-------------|-----------|--------------|--------------|---------------|--------------|
-| **Тип** | REST API | WebSocket | REST API | REST API | REST API | SPA |
-| **Порт** | 8080 | 8081 | 8082 | 8083 | 8084 | 3000 |
-| **Технологии** | Scala + ZIO | Scala + ZIO | Scala + ZIO | Scala + ZIO | Scala + ZIO | React + TS |
-| **State** | Stateless | Redis | Stateless | Redis + DB | Stateless | Browser |
-| **Масштабирование** | Горизонтальное | + Redis Pub/Sub | Горизонтальное | Горизонтальное | Горизонтальное | CDN |
-| **Auth** | JWT validation | JWT (WS param) | JWT + RBAC | JWT issuer | JWT + Admin | Cookies |
-
-### Зависимости сервисов
-
-| Сервис | PostgreSQL | Redis | Kafka | Зависит от |
-|--------|------------|-------|-------|------------|
-| API Gateway | ✅ (api_keys) | ✅ (cache) | ❌ | Auth, User, Block 2 |
-| WebSocket Service | ❌ | ✅ (state) | ✅ (consume) | Auth Service |
-| User Service | ✅ (users) | ✅ (cache) | ❌ | Auth Service |
-| Auth Service | ✅ (sessions) | ✅ (tokens) | ❌ | User Service (verify) |
-| Admin Service | ✅ (audit) | ✅ (cache) | ✅ (audit events) | Auth, User |
-| Web Frontend | ❌ | ❌ | ❌ | API Gateway, WebSocket |
-
-### Endpoints по сервисам
-
-| Сервис | Endpoints | Основные операции |
-|--------|-----------|-------------------|
-| **API Gateway** | `/api/v1/*` | Роутинг, rate limiting, агрегация |
-| **WebSocket** | `/ws` | Real-time позиции, команды, уведомления |
-| **User Service** | `/users/*`, `/orgs/*` | CRUD пользователей, организации |
-| **Auth Service** | `/auth/*` | Login, logout, refresh, 2FA |
-| **Admin Service** | `/admin/*` | Системные настройки, аудит, мониторинг |
-| **Web Frontend** | `/` | UI для мониторинга, управление устройствами |
-
-### PostMVP сервисы
-
-| Сервис | Назначение | Порт |
-|--------|------------|------|
-| **Billing Service** | Тарифы, платежи, подписки | 8085 |
-| **Route Service** | Маршруты, путевые листы, контроль рейсов | 8086 |
+| Параметр | API Gateway | Auth Service | User Service | WebSocket | Admin Svc | Web Frontend |
+|----------|-------------|-------------|-------------|-----------|-----------|-------------|
+| **Порт** | 8080 | 8082 | 8091 | 8081 | 8097 | 3001 |
+| **Тип** | REST proxy | REST | REST | WS | REST | SPA |
+| **Язык** | Scala 3 | Scala 3 | Scala 3 | Scala 3 | Scala 3 | TypeScript |
+| **БД** | — | PG + Redis | PG | — | PG | — |
+| **State** | Redis (lettuce) | Redis (lettuce) | Ref | Ref + Kafka | Ref | Zustand |
+| **Auth** | JWT validate | JWT issue | JWT + RBAC | JWT (WS) | JWT admin | Cookie |
+| **Масштаб.** | Горизонтальное | Горизонтальное | Горизонтальное | + Redis Pub/Sub | Горизонтальное | CDN |
 
 ---
 
-## 🚀 Развёртывание
+## 🚀 Deployment
 
 ### Docker Compose (dev)
 
 ```yaml
 services:
-  # ============ API Gateway ============
   api-gateway:
-    build: ./services/api-gateway
-    ports:
-      - "8080:8080"
+    build: ./services/API-Gateway
+    ports: ["8080:8080"]
     environment:
-      - DATABASE_URL=postgresql://postgres:5432/tracker
-      - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=${JWT_SECRET}
-      - AUTH_SERVICE_URL=http://auth-service:8083
-      - USER_SERVICE_URL=http://user-service:8082
-    depends_on:
-      - postgres
-      - redis
-      - auth-service
-      - user-service
+      REDIS_URL: redis://redis:6379
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY}
+      AUTH_SERVICE_URL: http://auth-service:8082
+    depends_on: [redis]
 
-  # ============ WebSocket Service ============
   websocket-service:
     build: ./services/websocket-service
-    ports:
-      - "8081:8081"
+    ports: ["8081:8081"]
     environment:
-      - KAFKA_BROKERS=kafka:9092
-      - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=${JWT_SECRET}
-    depends_on:
-      - kafka
-      - redis
+      KAFKA_BROKERS: kafka:9092
+      REDIS_URL: redis://redis:6379
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY}
+    depends_on: [kafka, redis]
 
-  # ============ User Service ============
-  user-service:
-    build: ./services/user-service
-    ports:
-      - "8082:8082"
-    environment:
-      - DATABASE_URL=postgresql://postgres:5432/tracker
-      - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=${JWT_SECRET}
-    depends_on:
-      - postgres
-      - redis
-
-  # ============ Auth Service ============
   auth-service:
     build: ./services/auth-service
-    ports:
-      - "8083:8083"
+    ports: ["8082:8082"]
     environment:
-      - DATABASE_URL=postgresql://postgres:5432/tracker
-      - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=${JWT_SECRET}
-      - JWT_ACCESS_EXPIRY=15m
-      - JWT_REFRESH_EXPIRY=7d
-      - USER_SERVICE_URL=http://user-service:8082
-    depends_on:
-      - postgres
-      - redis
+      DATABASE_URL: postgresql://postgres:5432/tracker
+      REDIS_URL: redis://redis:6379
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY}
+      JWT_ACCESS_EXPIRY: 15m
+      JWT_REFRESH_EXPIRY: 7d
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+    depends_on: [postgres, redis]
 
-  # ============ Admin Service ============
-  admin-service:
-    build: ./services/admin-service
-    ports:
-      - "8084:8084"
+  user-service:
+    build: ./services/user-service
+    ports: ["8091:8091"]
     environment:
-      - DATABASE_URL=postgresql://postgres:5432/tracker
-      - REDIS_URL=redis://redis:6379
-      - KAFKA_BROKERS=kafka:9092
-      - JWT_SECRET=${JWT_SECRET}
-    depends_on:
-      - postgres
-      - redis
-      - kafka
-      - auth-service
+      DATABASE_URL: postgresql://postgres:5432/tracker
+    depends_on: [postgres]
 
-  # ============ Web Frontend ============
   web-frontend:
     build: ./services/web-frontend
-    ports:
-      - "3000:80"
+    ports: ["3001:80"]
     environment:
-      - VITE_API_URL=http://localhost:8080
-      - VITE_WS_URL=ws://localhost:8081
-    depends_on:
-      - api-gateway
-      - websocket-service
+      VITE_API_URL: http://localhost:8080
+      VITE_WS_URL: ws://localhost:8081
+
+  admin-service:
+    build: ./services/admin-service
+    ports: ["8097:8097"]
+    environment:
+      DATABASE_URL: postgresql://postgres:5432/tracker
+    depends_on: [postgres]
 ```
 
 ### Nginx Config (production)
@@ -1480,19 +1294,22 @@ upstream api {
 upstream websocket {
     server ws-service-1:8081;
     server ws-service-2:8081;
-    # sticky sessions для WS
-    ip_hash;
+    ip_hash;  # sticky sessions для WS
 }
 
 server {
     listen 443 ssl http2;
     server_name tracker.example.com;
 
-    # API
+    ssl_certificate     /etc/nginx/ssl/cert.pem;
+    ssl_certificate_key /etc/nginx/ssl/key.pem;
+
+    # REST API
     location /api/ {
         proxy_pass http://api;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 
     # WebSocket
@@ -1504,17 +1321,18 @@ server {
         proxy_read_timeout 86400;
     }
 
-    # Static files (frontend)
+    # Frontend static
     location / {
         root /var/www/tracker;
         try_files $uri /index.html;
+        expires 1d;
     }
 }
 ```
 
 ---
 
-**Дата:** 26 января 2026  
-**Статус:** Block 3 документация готова ✅
+**Предыдущий блок:** [ARCHITECTURE_BLOCK2.md](./ARCHITECTURE_BLOCK2.md) — Бизнес-логика  
+**Общая архитектура:** [ARCHITECTURE.md](../ARCHITECTURE.md)
 
-**Следующий шаг:** [DATA_STORES.md](./DATA_STORES.md) — Схемы хранилищ
+*Версия: 2.0 | Обновлён: 6 марта 2026*
