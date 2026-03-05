@@ -41,3 +41,12 @@
 [submodule "services/user-service"]
 	path = services/user-service
 	url = git@github.com:revarewerd/user-service.git
+[submodule "services/websocket-service"]
+	path = services/websocket-service
+	url = git@github.com:revarewerd/websocket-service.git
+[submodule "services/billing-service"]
+	path = services/billing-service
+	url = git@github.com:revarewerd/billing-service.git
+[submodule "services/ticket-service"]
+	path = services/ticket-service
+	url = git@github.com:revarewerd/ticket-service.git
