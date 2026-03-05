@@ -1,13 +1,13 @@
 # 🏗️ Архитектура Wayrecall Tracker System
 
-> Тег: `АКТУАЛЬНО` | Обновлён: `2026-06-02` | Версия: `4.0`
+> Тег: `АКТУАЛЬНО` | Обновлён: `2026-06-06` | Версия: `4.1`
 
 ---
 
 ## 📋 Обзор
 
 Микросервисная GPS-система реального времени для мониторинга транспорта.  
-**14 сервисов** (12 Scala 3 + ZIO 2, 2 React/TypeScript).
+**17 сервисов** (15 Scala 3 + ZIO 2, 2 React/TypeScript).
 
 **Стек:** Scala 3.4.0 + ZIO 2.0.20 + Kafka + TimescaleDB + PostGIS + Redis (lettuce)
 
@@ -77,10 +77,11 @@
 │  BLOCK 3: ПРЕДСТАВЛЕНИЕ                                                    │
 │  ─────────────────────────────────────────────────────────────────────────  │
 │                                                                             │
-│  API Gateway                            WebSocket Service                   │
-│  ├─ REST endpoints                      ├─ Realtime positions              │
-│  ├─ JWT authentication                  ├─ Live alerts                     │
-│  └─ Rate limiting                       └─ Command results                 │
+│  API Gateway                            WebSocket Service (:8090)            │
+│  ├─ REST endpoints                      ├─ Kafka consumer (Smart Consumer) │
+│  ├─ JWT authentication                  ├─ Realtime positions (throttled)  │
+│  └─ Rate limiting                       ├─ Geozone/Speed alerts            │
+│                                         └─ 60 unit tests ✅               │
 │                                                                             │
 │  Web Frontend (React + Leaflet)                                            │
 │  ├─ Map с позициями                                                        │
@@ -120,11 +121,15 @@ Connection Manager
 
 | Топик | Partitions | Retention | Throughput | Consumer |
 |-------|------------|-----------|------------|----------|
-| **gps-events** | 12 | 7 дней | ~2 MB/s | History Writer |
+| **gps-events** | 12 | 7 дней | ~2 MB/s | History Writer, WebSocket Service (ws-positions) |
 | **gps-events-rules** | 6 | 7 дней | ~0.6 MB/s | Geozones Service |
 | device-status | 6 | 7 дней | ~15 KB/s | Device Manager |
-| geozone-events | 6 | 30 дней | ~100 KB/s | Notifications |
+| geozone-events | 6 | 30 дней | ~100 KB/s | Notifications, WebSocket Service (ws-events) |
+| **rule-violations** | 6 | 30 дней | ~50 KB/s | Notifications, WebSocket Service (ws-events) |
 | command-audit | 3 | 90 дней | ~15 KB/s | Analytics |
+| billing-events | 6 | 90 дней | ~10 KB/s | Analytics, Admin |
+| billing-commands | 3 | 30 дней | ~5 KB/s | Billing Service |
+| ticket-events | 3 | 90 дней | ~5 KB/s | Notification Service, Analytics |
 
 ---
 
@@ -195,14 +200,17 @@ unknown:{imei}:attempts  (STRING, TTL 1h)
 | 9 | Maintenance Service | HTTP 8087 | ✅ Компилируется |
 | 10 | Admin Service | HTTP 8097 | ✅ Компилируется |
 | 11 | User Service | HTTP 8091 | ✅ Компилируется |
+| 12 | Billing Service | HTTP 8099 | ✅ 80 тестов |
+| 13 | Ticket Service | HTTP 8101 | ✅ 58 тестов |
 
 ### Block 3 — Представление
 
 | # | Сервис | Порт | Статус |
 |---|--------|------|--------|
-| 12 | API Gateway | HTTP 8080 | ✅ Компилируется |
-| 13 | Web Frontend | HTTP 3001 | ✅ Компилируется |
-| 14 | Web Billing | HTTP 3002 | ✅ Компилируется (React shell) |
+| 14 | API Gateway | HTTP 8080 | ✅ Компилируется |
+| 15 | WebSocket Service | HTTP 8090 (WS + REST) | ✅ 60 тестов |
+| 16 | Web Frontend | HTTP 3001 | ✅ Компилируется |
+| 17 | Web Billing | HTTP 3002 | ✅ Компилируется (React shell) |
 
 ---
 
@@ -244,9 +252,12 @@ HTTP (Block 2):
   8096: Integration Service
   8097: Admin Service
   8098: Sensors Service
+  8099: Billing Service
+  8101: Ticket Service
 
 HTTP (Block 3):
   8080: API Gateway (public)
+  8090: WebSocket Service (WS + health)
   3001: Web Frontend (React dev)
   3002: Web Billing (React dev)
 
@@ -288,6 +299,9 @@ Infrastructure:
 - [services/ADMIN_SERVICE.md](./services/ADMIN_SERVICE.md) — Admin Service
 - [services/USER_SERVICE.md](./services/USER_SERVICE.md) — User Service
 - [services/API_GATEWAY.md](./services/API_GATEWAY.md) — API Gateway
+- [WebSocket Service docs](../services/websocket-service/docs/) — WebSocket Service (real-time WS)
+- [Billing Service docs](../services/billing-service/docs/) — Billing Service (оплата, тарифы)
+- [Ticket Service docs](../services/ticket-service/docs/) — Ticket Service (тикеты поддержки)
 - [services/WEB_FRONTEND.md](./services/WEB_FRONTEND.md) — Web Frontend
 
 ### Legacy
@@ -295,5 +309,5 @@ Infrastructure:
 
 ---
 
-**Версия:** 4.0  
-**Дата:** 2 июня 2026
+**Версия:** 4.2  
+**Дата:** 5 марта 2026

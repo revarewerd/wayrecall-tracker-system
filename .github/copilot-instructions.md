@@ -201,6 +201,8 @@ wayrecall-tracker/
 │   ├── integration-service/        # Ретрансляция: Wialon, webhooks (Block 2)
 │   ├── maintenance-service/        # Плановое ТО, пробег, напоминания (Block 2)
 │   ├── sensors-service/            # Датчики, калибровка, события (Block 2)
+│   ├── billing-service/            # Тарифы, оплата, подписки, счета (Block 2)
+│   ├── ticket-service/             # Тикеты техподдержки, диалоги (Block 2)
 │   ├── web-billing/                # Биллинг (PostMVP)
 │   ├── web-frontend/               # React + Leaflet (Block 3)
 │   └── API-Gateway/                # Аутентификация, маршрутизация (Block 3)
@@ -359,13 +361,15 @@ services/[service-name]/
 | **Integration Service** | 8096 | Ретрансляция GPS в Wialon/Navixy, webhooks, Inbound API |
 | **Admin Service** | 8097 | Мониторинг системы, управление Kafka/Redis, health check |
 | **Sensors Service** | 8098 | Обработка датчиков, калибровка, события (слив/заправка) |
+| **Billing Service** | 8099 | Тарифы, подписки, оплата, счета, баланс |
+| **Ticket Service** | 8101 | Тикеты техподдержки, диалоги, настройки уведомлений |
 
-### Block 3 — Presentation (в дизайне)
+### Block 3 — Presentation
 
 | Сервис | Порт | Ответственность |
 |---|---|---|
 | **API Gateway** | 8080 | Аутентификация, маршрутизация, rate limiting |
-| **WebSocket Service** | 8081 | Real-time обновления позиций и событий |
+| **WebSocket Service** | 8090 | Real-time GPS позиции, геозоны, скорость (Kafka → WS). 60 тестов ✅ |
 | **Web Frontend** | 3001 | React + Leaflet: карта, маршруты, управление |
 
 ### Правила разграничения
@@ -427,11 +431,12 @@ Block 2 — Business Logic:
   8096: Integration Service
   8097: Admin Service
   8098: Sensors Service
-  8099+: следующие сервисы по порядку
+  8099: Billing Service
+  8101: Ticket Service
 
 Block 3 — Presentation:
   8080: API Gateway (public, клиенты)
-  8081: WebSocket Gateway (real-time events)
+  8090: WebSocket Service (WS + health, real-time GPS)
   3001: Web Frontend (React dev server)
 
 Инфраструктура (дефолтные):
@@ -492,6 +497,61 @@ Block 3 — Presentation:
 - **Kafka топики и маршруты** — см. **[infra/kafka/TOPICS.md](../infra/kafka/TOPICS.md)**
 - **Redis ключи и структуры** — см. **[infra/redis/](../infra/redis/)**
 - **GPS протоколы** — см. **[infra/gps-protocols/](../infra/gps-protocols/)**
+
+---
+
+## 12. Стандарт логирования (ZIO Logging)
+
+### Уровни логирования
+
+| Уровень | Когда использовать | Примеры |
+|---|---|---|
+| `ZIO.logInfo` | Успешные бизнес-операции, создание/изменение/удаление сущностей, важные переходы состояний | Создание устройства, вход в геозону, выполненное ТО, превышение скорости |
+| `ZIO.logWarning` | Отказ в доступе, некорректные данные, деактивация, сервис недоступен, аномалии | Permission denied, дубликат email, слив топлива, деактивация ключа |
+| `ZIO.logDebug` | SQL запросы, cache hit/miss, pipeline шаги, промежуточные результаты | Кеш-хит правил, количество кандидатов SpatialGrid, pending anti-bounce |
+| `ZIO.logError` | Непредвиденные ошибки, потеря данных, критические сбои | Ошибка записи в Kafka, S3 upload fail, потеря TCP соединения |
+
+### Правила
+
+1. **Все лог-сообщения на русском языке** (кроме технических ID и значений)
+2. **Включать контекст**: всегда указывать `vehicleId`, `orgId`, `userId`, `imei` или другой релевантный ID
+3. **Префикс модуля**: начинать сообщение с имени модуля — `"Геозоны: ..."`, `"Скорость: ..."`, `"ТО: ..."`, `"Шаблон: ..."`, `"Webhook: ..."`
+4. **Не логировать секреты**: пароли, токены, API-ключи (можно первые 4 символа + `...`)
+5. **Логировать результат, не процесс**: "Создан шаблон ТО: id=X" > "Начинаем создание шаблона"
+6. **При ошибках — включать причину**: `"Webhook: ошибка URL — HTTP 503 (120ms)"`
+7. **Rate-sensitive методы** (вызов на каждую GPS-точку): использовать `ZIO.logDebug` или `ZIO.when(condition)(ZIO.logInfo(...))`
+8. **Кеш-операции**: всегда логировать hit/miss с количеством записей
+
+### Минимальные требования по пакетам
+
+| Пакет | Минимум логов |
+|---|---|
+| `service/` | `logInfo` для каждой мутирующей операции (create/update/delete) |
+| `kafka/` | `logInfo` при старте consumer, `logWarning` при ошибке парсинга |
+| `processing/` | `logDebug` при входе в pipeline с количеством элементов |
+| `channel/` | `logInfo`/`logWarning` для каждой отправки (успех/неуспех) |
+| `storage/` | `logDebug` для cache hit/miss, `logWarning` для throttle/rate-limit |
+| `api/` | логирование через middleware (API Gateway); отдельные логи не обязательны |
+| `domain/`, `config/` | логирование не нужно |
+
+### Пример правильного логирования (for-comprehension)
+
+```scala
+def createTemplate(companyId: UUID, req: CreateTemplateRequest): Task[MaintenanceTemplate] =
+  for {
+    _ <- ZIO.logInfo(s"ТО: создание шаблона '${req.name}', компания=$companyId")
+    // ... бизнес-логика ...
+    _ <- templateRepo.create(template)
+    _ <- ZIO.logInfo(s"ТО: шаблон создан id=$templateId, name='${req.name}'")
+  } yield template
+```
+
+### Anti-patterns
+
+- ❌ `ZIO.logInfo("OK")` — нет контекста
+- ❌ `println(s"Debug: $x")` — использовать ZIO Logging
+- ❌ Логировать каждую GPS-точку на уровне Info — перегрузка логов
+- ❌ `catchAll(_ => ZIO.logError(...))` без re-throw — проглатывание ошибок
 
 ---
 
@@ -582,6 +642,9 @@ Block 3 — Presentation:
 | `KAFKA.md` | Какие топики consume/produce (со ссылкой на infra/kafka/TOPICS.md) | если есть Kafka |
 | `DECISIONS.md` | ADR — почему приняты решения | Да |
 | `RUNBOOK.md` | Запуск, дебаг, типичные ошибки | Да |
+| `TESTING.md` | Описание всех тестов | Да |
+| `LEARNING.md` | ПОдробные гайд как разобраться с кодом, изучить сервис | Да |
+| `INDEX.md` | описание документов, где что лежит внутри сервиса | Да |
 
 **Правило:** не дублируй информацию. Используй ссылки на `/infra/`.
 
@@ -851,8 +914,10 @@ Scope: cm, dm, hw, rc, ns, as, us, ads, is, ms, ss, infra, docs
 - **[services/user-service/docs/](../services/user-service/docs/)** — Пользователи, роли, организации
 - **[services/admin-service/docs/](../services/admin-service/docs/)** — Администрирование, мониторинг
 - **[services/integration-service/docs/](../services/integration-service/docs/)** — Ретрансляция, Wialon, webhooks
+- **[services/billing-service/docs/](../services/billing-service/docs/)** — Тарифы, оплата, подписки, счета
+- **[services/ticket-service/docs/](../services/ticket-service/docs/)** — Тикеты техподдержки, диалоги
 
 ---
 
-*Версия: 4.0 | Обновлён: 1 марта 2026 | Тег: АКТУАЛЬНО*
+*Версия: 4.1 | Обновлён: 5 марта 2026 | Тег: АКТУАЛЬНО*
 *Maintained by: Development Team*

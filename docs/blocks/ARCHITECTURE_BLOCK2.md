@@ -2,8 +2,8 @@
 
 > Тег: `АКТУАЛЬНО` | Обновлён: `2026-03-06` | Версия: `2.0`
 >
-> **Ответственность:** Обработка GPS событий, геозоны, уведомления, аналитика, интеграции, датчики, ТО  
-> **Сервисы (8):** Rule Checker, Notification Service, Sensors Service, Integration Service, Analytics Service, Maintenance Service, Admin Service, User Service
+> **Ответственность:** Обработка GPS событий, геозоны, уведомления, аналитика, интеграции, датчики, ТО, биллинг, тикеты  
+> **Сервисы (10):** Rule Checker, Notification Service, Sensors Service, Integration Service, Analytics Service, Maintenance Service, Admin Service, User Service, Billing Service, Ticket Service
 
 > **⚠️ ТЕКУЩЕЕ ОГРАНИЧЕНИЕ (2026-03-06):**  
 > `zio-redis` несовместим с ZIO 2.0.20 + Scala 3.4.0. В сервисах Block 2 кэширование реализовано через **ZIO `Ref` (in-memory)**.  
@@ -25,9 +25,11 @@
 10. [Maintenance Service](#-maintenance-service)
 11. [Admin Service](#-admin-service)
 12. [User Service](#-user-service)
-13. [Взаимодействие сервисов](#-взаимодействие-всех-сервисов-block-2)
-14. [Kafka Topics](#-kafka-topics-block-2)
-15. [ER: Базы данных](#-er-базы-данных-block-2)
+13. [Billing Service](#-billing-service)
+14. [Ticket Service](#-ticket-service)
+15. [Взаимодействие сервисов](#-взаимодействие-всех-сервисов-block-2)
+16. [Kafka Topics](#-kafka-topics-block-2)
+17. [ER: Базы данных](#-er-базы-данных-block-2)
 16. [Сводная таблица](#-сводная-таблица-block-2)
 17. [Deployment](#-deployment)
 
@@ -79,6 +81,8 @@
 | 6 | **Maintenance Service** | 8087 | gps-events | maintenance-events | PostgreSQL, Ref | PostMVP |
 | 7 | **Admin Service** | 8097 | — | — | PostgreSQL, Ref | MVP |
 | 8 | **User Service** | 8091 | — | — | PostgreSQL, Ref | MVP |
+| 9 | **Billing Service** | 8099 | device-events, billing-commands | billing-events | PostgreSQL, Ref | MVP (80 тестов) |
+| 10 | **Ticket Service** | 8101 | — | ticket-events | PostgreSQL, Ref | MVP (58 тестов) |
 
 ---
 
@@ -1577,11 +1581,63 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:5432/tracker
     depends_on: [postgres]
+
+  billing-service:
+    build: ./services/billing-service
+    ports: ["8099:8099"]
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      DATABASE_URL: postgresql://postgres:5432/wayrecall_billing
+    depends_on: [kafka, postgres]
+
+  ticket-service:
+    build: ./services/ticket-service
+    ports: ["8101:8101"]
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      DATABASE_URL: postgresql://postgres:5432/wayrecall_tickets
+    depends_on: [kafka, postgres]
 ```
+
+---
+
+## 💳 Billing Service
+
+**Порт:** 8099 | **Ответственность:** Тарифы, подписки, оплата, счета, баланс
+
+**Ключевые возможности:**
+- Управление тарифными планами с компонентными ценами (GPS, геозоны, датчики, история)
+- Подписки с auto-renew, trial периодом, grace period
+- Provider-agnostic оплата (Тинькофф, Сбер, YooKassa, Mock)
+- Автоматическое списание по расписанию (FeeProcessor)
+- Счета (Invoice) с PDF генерацией
+
+**Kafka:** billing-events (out), billing-commands (in), device-events (in)  
+**БД:** PostgreSQL (wayrecall_billing)  
+**Тесты:** 80 (100% pass)  
+**Подробнее:** [billing-service/docs/README.md](../../services/billing-service/docs/README.md)
+
+---
+
+## 🎫 Ticket Service
+
+**Порт:** 8101 | **Ответственность:** Тикеты технической поддержки, диалоги с пользователями
+
+**Ключевые возможности:**
+- CRUD тикетов с категориями (Оборудование, Программа, Финансы) и приоритетами
+- Диалоговая система сообщений (User ↔ Support)
+- Статусная модель: New → Open → InProgress → Resolved → Closed
+- Настройки уведомлений по категориям
+- Пометка прочитанности (userRead/supportRead)
+
+**Kafka:** ticket-events (out)  
+**БД:** PostgreSQL (wayrecall_tickets)  
+**Тесты:** 58 (100% pass)  
+**Подробнее:** [ticket-service/docs/README.md](../../services/ticket-service/docs/README.md)
 
 ---
 
 **Предыдущий блок:** [ARCHITECTURE_BLOCK1.md](./ARCHITECTURE_BLOCK1.md) — Сбор данных  
 **Следующий блок:** [ARCHITECTURE_BLOCK3.md](./ARCHITECTURE_BLOCK3.md) — Представление
 
-*Версия: 2.0 | Обновлён: 6 марта 2026*
+*Версия: 2.1 | Обновлён: 5 марта 2026*

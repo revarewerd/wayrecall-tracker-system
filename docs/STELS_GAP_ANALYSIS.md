@@ -56,8 +56,8 @@
 | **Аутентификация** | Spring Security (sessions) | API Gateway + Auth (JWT) | 🔵 | Лучше: JWT, OAuth 2.0, API Keys |
 | **Web UI (карта)** | ExtJS + OpenLayers | React + Leaflet | 🔵 | Современный стек |
 | **Real-time позиции** | Long polling (getUpdatedAfter, 2с) | WebSocket Service | 🔵 | Лучше: WebSocket вместо polling |
-| **Биллинг** | Axon CQRS (30+ файлов) | web-billing (React shell) | ❌ | Нет backend-сервиса! |
-| **Тикеты/заявки** | TicketAggregate (Axon CQRS) | — | ❌ | Нет сервиса |
+| **Биллинг** | Axon CQRS (30+ файлов) | Billing Service (8099) | ✅ | 80 тестов, provider-agnostic |
+| **Тикеты/заявки** | TicketAggregate (Axon CQRS) | Ticket Service (8101) | ✅ | 58 тестов, диалоги, уведомления |
 | **Поддержка** | SupportRequestDAO, SupportEmailNotificationDAO | — | ❌ | Нет сервиса |
 | **Дилеры** | DealersService, DealersTariffPlans | — | ❌ | Нет модуля |
 | **Группы объектов** | GroupsOfObjects | User Service (частично) | 🟡 | Базовая группировка, без вложенности |
@@ -185,7 +185,14 @@ Legacy `GroupsOfObjects` — дерево групп с вложенностью
 
 ### 4.1 🔴 КРИТИЧЕСКИЕ (нужны для production)
 
-#### GAP-1: Billing Service (Backend)
+#### GAP-1: Billing Service (Backend) — ✅ РЕАЛИЗОВАНО
+
+**Реализовано:** `services/billing-service/` — Scala 3 + ZIO 2, порт 8099, 80 тестов (100% pass).  
+Включает: Account, TariffPlan, Subscription, Payment, Invoice, FeeProcessor.  
+Provider-agnostic оплата (Тинькофф, Сбер, YooKassa, Mock). Kafka: billing-events, billing-commands.  
+**GitHub:** https://github.com/revarewerd/billing-service
+
+<details><summary>Предыдущий анализ (legacy)</summary>
 
 **Legacy:** 30+ файлов Axon CQRS
 ```
@@ -215,6 +222,8 @@ NotificationPaymentList
 - API: REST для управления биллингом
 - Kafka: consume device-events для расчёта пробега/моточасов
 - Интеграция с платёжными системами (Stripe/YooKassa)
+
+</details>
 
 #### GAP-2: Reverse Geocoding Service
 
@@ -250,7 +259,14 @@ NotificationPaymentList
 
 ### 4.2 🟡 СРЕДНИЕ (нужны для feature parity)
 
-#### GAP-4: Ticket/Support System
+#### GAP-4: Ticket/Support System — ✅ РЕАЛИЗОВАНО
+
+**Реализовано:** `services/ticket-service/` — Scala 3 + ZIO 2, порт 8101, 58 тестов (100% pass).  
+Включает: Тикеты, диалоги (User ↔ Support), статусная модель, настройки уведомлений.  
+Kafka: ticket-events. Категории: Equipment, Program, Finance.  
+**GitHub:** https://github.com/revarewerd/ticket-service
+
+<details><summary>Предыдущий анализ (legacy)</summary>
 
 **Legacy:** 8+ файлов (Axon CQRS)
 ```
@@ -269,6 +285,8 @@ SupportRequestDAO, SupportRequestEDS, SupportEmailNotificationDAO
 - REST API: CRUD тикетов, комментарии, смена статуса
 - Kafka: produce `ticket-events` → Notification Service
 - Порт: 8101 (если отдельный)
+
+</details>
 
 #### GAP-5: State Report + Addresses Report
 

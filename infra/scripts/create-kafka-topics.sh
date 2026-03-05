@@ -94,11 +94,34 @@ create_topic "command-audit" 3 7776000000
 # 30 дней retention
 create_topic "geozone-events" 6 2592000000
 
+# ============================================================
+# БЛОК 2: Billing Service
+# ============================================================
+
+# События биллинга (создание аккаунта, оплата, подписка и т.д.)
+# 6 партиций (по organizationId)
+# 90 дней retention (7776000000 ms)
+create_topic "billing-events" 6 7776000000
+
+# Команды биллинга (начисления, списания)
+# 3 партиции
+# 30 дней retention
+create_topic "billing-commands" 3 2592000000
+
+# ============================================================
+# БЛОК 2: Ticket Service
+# ============================================================
+
+# События тикетов (создание, обновление, сообщения)
+# 3 партиции (по accountId)
+# 90 дней retention
+create_topic "ticket-events" 3 7776000000
+
 echo ""
 echo "✅ Все топики созданы успешно!"
 echo ""
 echo "📋 Проверка топиков:"
-kafka-topics --list --bootstrap-server "$KAFKA_HOST" | grep -E "(gps|device|command|geozone|unknown)" || true
+kafka-topics --list --bootstrap-server "$KAFKA_HOST" | grep -E "(gps|device|command|geozone|unknown|billing|ticket)" || true
 echo ""
 echo "🎯 Для просмотра конфигурации топика:"
 echo "   kafka-topics --describe --bootstrap-server $KAFKA_HOST --topic gps-events"
