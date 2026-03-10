@@ -1,6 +1,6 @@
 # 🖥️ Block 3: Представление
 
-> Тег: `АКТУАЛЬНО` | Обновлён: `2026-03-06` | Версия: `2.0`
+> Тег: `АКТУАЛЬНО` | Обновлён: `2026-06-06` | Версия: `2.1`
 >
 > **Ответственность:** API для клиентов, аутентификация, real-time обновления, веб-интерфейс  
 > **Сервисы (6):** API Gateway, Auth Service, User Service, WebSocket Service, Admin Service, Web Frontend
@@ -46,11 +46,11 @@
 │  ┌───────────────┐                      ┌───────────────┐                  │
 │  │  API Gateway  │                      │   WebSocket   │                  │
 │  │  (REST API)   │                      │   Service     │                  │
-│  │    :8080      │                      │    :8081      │                  │
+│  │    :8080      │                      │    :8090      │                  │
 │  └───────┬───────┘                      └───────┬───────┘                  │
 │          │                                      │                          │
-│  ┌───────┴───────┐                     Kafka + Redis Pub/Sub               │
-│  │  Auth Service │                              │                          │
+│  ┌───────┴───────┐                     Kafka (gps-events,                    │
+│  │  Auth Service │                     geozone-events, rule-violations)      │
 │  │  (JWT, OAuth) │                              │                          │
 │  │    :8082      │                              │                          │
 │  └───────────────┘                              │                          │
@@ -70,7 +70,7 @@
 | 1 | **API Gateway** | 8080 | REST proxy | Redis (lettuce) — rate limit, cache | MVP |
 | 2 | **Auth Service** | 8082 | REST | PostgreSQL + Redis — sessions, tokens | MVP |
 | 3 | **User Service** | 8091 | REST | PostgreSQL — users, orgs, roles | MVP |
-| 4 | **WebSocket Service** | 8081 | WS | Redis Pub/Sub, Kafka | MVP |
+| 4 | **WebSocket Service** | 8090 | WS + REST | Kafka (gps-events, geozone-events, rule-violations), In-memory (ZIO Ref) | MVP ✅ 60 тестов |
 | 5 | **Admin Service** | 8097 | REST | PostgreSQL — config, audit | MVP |
 | 6 | **Web Frontend** | 3001 | SPA | — (browser state) | MVP |
 
@@ -107,7 +107,7 @@ flowchart TB
         Invite["Invitations"]
     end
 
-    subgraph WS["WebSocket Service :8081"]
+    subgraph WS["WebSocket Service :8090"]
         Upgrader["HTTP→WS Upgrader"]
         RoomMgr["Room Manager\n(org, device, alerts)"]
         Broadcaster["Event Broadcaster"]
@@ -607,9 +607,9 @@ flowchart TB
 | Параметр | Значение |
 |----------|----------|
 | **Ответственность** | Real-time позиции, события, алерты |
-| **Порт** | 8081 |
-| **Источники** | Kafka (gps-events), Redis Pub/Sub |
-| **Rooms** | org:{id}, device:{id}, alerts:{id} |
+| **Порт** | 8090 |
+| **Источники** | Kafka: gps-events (group: ws-positions), geozone-events + rule-violations (group: ws-events) |
+| **Подписки** | vehicleId (Set) + orgId (all vehicles) — Dual Index pattern |
 
 ### Архитектура
 
@@ -636,16 +636,14 @@ flowchart TB
     end
 
     subgraph Sources["Источники событий"]
-        KafkaGPS["Kafka:\ngps-events"]
-        KafkaEvents["Kafka:\ngeozone-events\nspeed-events\nsensor-events"]
-        RedisPub["Redis Pub/Sub:\ncmd-response:{imei}\nconnection-status"]
+        KafkaGPS["Kafka:\ngps-events\n(group: ws-positions)"]
+        KafkaEvents["Kafka:\ngeozone-events\nrule-violations\n(group: ws-events)"]
     end
 
     B1 & B2 & M -->|ws://| Upgrader --> AuthWS --> ConnMgr --> Rooms
     
     KafkaGPS --> MsgHandler
     KafkaEvents --> MsgHandler
-    RedisPub --> MsgHandler
     
     MsgHandler --> |broadcast| Rooms --> Clients
 ```
@@ -663,8 +661,7 @@ sequenceDiagram
 
     Note over B,WS: Инициализация подписки
 
-    B->>WS: ws://host:8081/ws?token=JWT
-    WS->>WS: Validate JWT → user_id=42, org_id=123
+    B->>WS: ws://host:8090/ws?orgId=123
     WS-->>B: Connected ✓
 
     B->>WS: {"type":"subscribe","channel":"org:123"}
@@ -709,18 +706,12 @@ sequenceDiagram
 
 ### Redis структуры для WS
 
-```
-# Подписки (для горизонтального масштабирования)
-ws:subs:org:{org_id}           SET of node_ids
-ws:subs:device:{device_id}     SET of node_ids
-
-# Pub/Sub каналы для кросс-нод broadcast
-SUBSCRIBE ws:broadcast:org:{org_id}
-SUBSCRIBE ws:broadcast:device:{device_id}
-
-# Мониторинг подключений
-ws:connections:{node_id}       HASH {user_id → metadata}
-```
+> **Текущая реализация:** Redis НЕ используется. Всё состояние хранится in-memory через **ZIO Ref**:
+> - `connections: Ref[Map[UUID, ActiveConnection]]` — активные WS соединения
+> - `vehicleIndex: Ref[Map[Long, Set[UUID]]]` — vehicleId → подписчики
+> - `orgIndex: Ref[Map[Long, Set[UUID]]]` — orgId → подписчики на всю организацию
+>
+> Для горизонтального масштабирования в будущем: Redis Pub/Sub для кросс-нод broadcast.
 
 ---
 
@@ -788,7 +779,7 @@ flowchart TB
 
     subgraph Backend["Backend"]
         GW["API Gateway :8080"]
-        WS["WebSocket :8081"]
+        WS["WebSocket :8090"]
     end
 
     Router --> Pages
@@ -984,7 +975,7 @@ sequenceDiagram
     participant GW as API Gateway :8080
     participant AS as Auth :8082
     participant US as User :8091
-    participant WS as WebSocket :8081
+    participant WS as WebSocket :8090
     participant DM as Device Manager
     participant DB as PostgreSQL
     participant R as Redis
@@ -1015,7 +1006,7 @@ sequenceDiagram
 
     Note over B,CM: 3. WebSocket подписка
 
-    B->>WS: ws://host:8081/ws?token=JWT
+    B->>WS: ws://host:8090/ws?token=JWT
     WS->>WS: Validate JWT → org_id=123
     WS-->>B: Connected
 
@@ -1214,7 +1205,7 @@ GET    /api/v1/devices/{id}/stops     # Stop list
 
 | Параметр | API Gateway | Auth Service | User Service | WebSocket | Admin Svc | Web Frontend |
 |----------|-------------|-------------|-------------|-----------|-----------|-------------|
-| **Порт** | 8080 | 8082 | 8091 | 8081 | 8097 | 3001 |
+| **Порт** | 8080 | 8082 | 8091 | 8090 | 8097 | 3001 |
 | **Тип** | REST proxy | REST | REST | WS | REST | SPA |
 | **Язык** | Scala 3 | Scala 3 | Scala 3 | Scala 3 | Scala 3 | TypeScript |
 | **БД** | — | PG + Redis | PG | — | PG | — |
@@ -1241,7 +1232,7 @@ services:
 
   websocket-service:
     build: ./services/websocket-service
-    ports: ["8081:8081"]
+    ports: ["8090:8090"]
     environment:
       KAFKA_BROKERS: kafka:9092
       REDIS_URL: redis://redis:6379
@@ -1273,7 +1264,7 @@ services:
     ports: ["3001:80"]
     environment:
       VITE_API_URL: http://localhost:8080
-      VITE_WS_URL: ws://localhost:8081
+      VITE_WS_URL: ws://localhost:8090
 
   admin-service:
     build: ./services/admin-service
@@ -1292,8 +1283,8 @@ upstream api {
 }
 
 upstream websocket {
-    server ws-service-1:8081;
-    server ws-service-2:8081;
+    server ws-service-1:8090;
+    server ws-service-2:8090;
     ip_hash;  # sticky sessions для WS
 }
 

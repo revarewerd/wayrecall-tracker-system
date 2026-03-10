@@ -1,0 +1,144 @@
+# ============================================================
+# Wayrecall Tracker — Сервисы (Block 1: Data Collection)
+# CM + HW + DM — минимум для приёма GPS данных
+# ============================================================
+# Зависимости: docker-compose.infra.yml должен быть запущен
+# Сеть: tracker-network (created by infra)
+# ============================================================
+
+services:
+
+  # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+  # Connection Manager — приём TCP от GPS-трекеров
+  # Порты: 5002 (Wialon IPS), 10090 (HTTP API)
+  # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+  tracker-cm:
+    image: eclipse-temurin:21-jre-jammy
+    container_name: tracker-cm
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./jars/connection-manager.jar:/app/app.jar:ro
+    ports:
+      - "5001:5001"   # Teltonika
+      - "5002:5002"   # Wialon IPS
+      - "5003:5003"   # Ruptela
+      - "5004:5004"   # NavTelecom
+      - "10090:10090" # HTTP API (health, metrics)
+    environment:
+      # Redis
+      REDIS_HOST: tracker-redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: WayrecallRedis2026!
+      # Kafka
+      KAFKA_BOOTSTRAP_SERVERS: tracker-kafka:9092
+      # Instance
+      INSTANCE_ID: cm-prod-1
+      # JVM
+      JAVA_OPTS: >-
+        -Xms256m -Xmx1g
+        -XX:+UseG1GC
+        -XX:+UseContainerSupport
+        -XX:MaxRAMPercentage=75.0
+      # Logging
+      LOG_LEVEL: INFO
+    entrypoint: ["sh", "-c", "java $$JAVA_OPTS -jar /app/app.jar"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:10090/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    networks:
+      - tracker-network
+
+  # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+  # History Writer — запись GPS в TimescaleDB
+  # Kafka consumer: gps-events → TimescaleDB
+  # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+  tracker-hw:
+    image: eclipse-temurin:21-jre-jammy
+    container_name: tracker-hw
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./jars/history-writer-1.0.0.jar:/app/app.jar:ro
+    ports:
+      - "10091:10091" # HTTP API (health, query)
+    environment:
+      # Database (TimescaleDB)
+      APP_DATABASE_HOST: tracker-timescaledb
+      APP_DATABASE_PORT: 5432
+      APP_DATABASE_NAME: tracker
+      APP_DATABASE_USERNAME: tracker
+      APP_DATABASE_PASSWORD: WayrecallDB2026!
+      # Kafka
+      APP_KAFKA_BOOTSTRAP_SERVERS: tracker-kafka:9092
+      APP_KAFKA_GROUP_ID: history-writer
+      APP_KAFKA_AUTO_OFFSET_RESET: earliest
+      # JVM
+      JAVA_OPTS: >-
+        -Xms256m -Xmx1g
+        -XX:+UseG1GC
+        -XX:+UseContainerSupport
+        -XX:MaxRAMPercentage=75.0
+    entrypoint: ["sh", "-c", "java $$JAVA_OPTS -jar /app/app.jar"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:10091/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    networks:
+      - tracker-network
+
+  # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+  # Device Manager — REST API управления устройствами
+  # ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+  tracker-dm:
+    image: eclipse-temurin:21-jre-jammy
+    container_name: tracker-dm
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./jars/device-manager.jar:/app/app.jar:ro
+    ports:
+      - "10092:10092" # HTTP API
+    environment:
+      # Database (используем общую БД tracker)
+      APP_DATABASE_HOST: tracker-timescaledb
+      APP_DATABASE_PORT: 5432
+      APP_DATABASE_NAME: tracker
+      APP_DATABASE_USERNAME: tracker
+      APP_DATABASE_PASSWORD: WayrecallDB2026!
+      # Kafka
+      APP_KAFKA_BOOTSTRAP_SERVERS: tracker-kafka:9092
+      # Redis
+      APP_REDIS_HOST: tracker-redis
+      APP_REDIS_PORT: 6379
+      APP_REDIS_PASSWORD: WayrecallRedis2026!
+      # JVM
+      JAVA_OPTS: >-
+        -Xms256m -Xmx512m
+        -XX:+UseG1GC
+        -XX:+UseContainerSupport
+        -XX:MaxRAMPercentage=75.0
+    entrypoint: ["sh", "-c", "java $$JAVA_OPTS -jar /app/app.jar"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:10092/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    mem_limit: 1024m
+    memswap_limit: 1024m
+    networks:
+      - tracker-network
+
+networks:
+  tracker-network:
+    external: true

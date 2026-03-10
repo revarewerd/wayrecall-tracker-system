@@ -1,0 +1,58 @@
+# Prometheus — конфигурация для Wayrecall Tracker
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  # Метрики хоста (CPU, RAM, Disk, Network)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          instance: 'hp-dl180'
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Connection Manager × 4 инстанса (Block 1)
+  - job_name: 'connection-manager'
+    static_configs:
+      - targets:
+          - 'cm-teltonika:10090'
+          - 'cm-wialon:10090'
+          - 'cm-ruptela:10090'
+          - 'cm-navtelecom:10090'
+    metrics_path: '/metrics'
+
+  # Device Manager (Block 1)
+  - job_name: 'device-manager'
+    static_configs:
+      - targets: ['device-manager:10092']
+    metrics_path: '/metrics'
+
+  # History Writer (Block 1)
+  - job_name: 'history-writer'
+    static_configs:
+      - targets: ['history-writer:10091']
+    metrics_path: '/metrics'
+
+  # Rule Checker (Block 2)
+  - job_name: 'rule-checker'
+    static_configs:
+      - targets: ['rule-checker:8093']
+    metrics_path: '/metrics'
+
+  # Notification Service (Block 2)
+  - job_name: 'notification-service'
+    static_configs:
+      - targets: ['notification-service:8094']
+    metrics_path: '/metrics'
+
+  # WebSocket Service (Block 3)
+  - job_name: 'websocket-service'
+    static_configs:
+      - targets: ['websocket-service:8090']
+    metrics_path: '/metrics'

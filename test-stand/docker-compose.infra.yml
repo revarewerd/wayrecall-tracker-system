@@ -1,0 +1,287 @@
+# ============================================================
+# Wayrecall Tracker — Инфраструктура (Kafka, Redis, TimescaleDB, Monitoring)
+# ============================================================
+# Запуск:  docker compose -f docker-compose.infra.yml up -d
+# Статус:  docker compose -f docker-compose.infra.yml ps
+# Логи:    docker compose -f docker-compose.infra.yml logs -f kafka
+# ============================================================
+
+services:
+
+  # ==========================================================
+  # ZooKeeper — координатор Kafka
+  # ==========================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: tracker-zookeeper
+    hostname: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_INIT_LIMIT: 5
+      ZOOKEEPER_SYNC_LIMIT: 2
+      KAFKA_JMX_PORT: 9999
+      KAFKA_HEAP_OPTS: "-Xmx256m -Xms128m"
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok,stat,srvr,mntr"
+    volumes:
+      - /data/zookeeper/data:/var/lib/zookeeper/data
+      - /data/zookeeper/datalog:/var/lib/zookeeper/log
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc localhost 2181 | grep Zookeeper"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - tracker-network
+
+  # ==========================================================
+  # Kafka — event streaming (1 брокер, 20k+ точек/сек)
+  # ==========================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: tracker-kafka
+    hostname: kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      # 9092 — Docker internal (сервисы подключаются по kafka:9092)
+      # 29092 — доступ с хоста / LAN (для отладки, НЕ открыт наружу)
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${SERVER_IP:-192.168.1.5}:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Retention: 7 дней для main данных
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+      # Производительность
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_NUM_NETWORK_THREADS: 3
+      KAFKA_NUM_IO_THREADS: 8
+      KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
+      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
+      # JVM
+      KAFKA_HEAP_OPTS: "-Xmx1g -Xms1g"
+      KAFKA_JVM_PERFORMANCE_OPTS: "-XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35"
+    volumes:
+      - /data/kafka/kafka-logs:/var/lib/kafka/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - tracker-network
+
+  # ==========================================================
+  # TimescaleDB + PostGIS — GPS история + геозоны + master data
+  # Один инстанс: TimescaleDB hypertables + PostGIS + обычные таблицы
+  # ==========================================================
+  timescaledb:
+    image: timescale/timescaledb-ha:pg16
+    container_name: tracker-timescaledb
+    hostname: timescaledb
+    restart: unless-stopped
+    ports:
+      # 5433 на хосте (не 5432 чтобы не конфликтовать с локальным postgres)
+      # Доступен только из LAN (ufw)
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tracker}
+      POSTGRES_USER: ${POSTGRES_USER:-tracker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-WayrecallDB2026!}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: ${TZ:-Europe/Moscow}
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=2GB
+      -c effective_cache_size=6GB
+      -c work_mem=8MB
+      -c maintenance_work_mem=512MB
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c wal_buffers=64MB
+      -c max_wal_size=2GB
+      -c min_wal_size=512MB
+      -c checkpoint_completion_target=0.9
+      -c default_statistics_target=100
+      -c log_min_duration_statement=1000
+      -c log_timezone='Europe/Moscow'
+      -c timezone='Europe/Moscow'
+      -c timescaledb.max_background_workers=4
+    volumes:
+      - /data/timescaledb/pgdata:/var/lib/postgresql/data
+      - /data/timescaledb/pgwal:/var/lib/postgresql/pg_wal
+      # Локально: ../infra/postgresql/init.sql
+      # На сервере: ./init.sql (скопирован в ту же папку)
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tracker} -d ${POSTGRES_DB:-tracker}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - tracker-network
+
+  # ==========================================================
+  # Redis — кэш, очереди команд, device context, Pub/Sub
+  # ==========================================================
+  redis:
+    image: redis:7-alpine
+    container_name: tracker-redis
+    hostname: redis
+    restart: unless-stopped
+    ports:
+      # 6380 на хосте (не 6379 чтобы не конфликтовать)
+      # Доступен только из LAN (ufw)
+      - "6380:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --requirepass ${REDIS_PASSWORD:-WayrecallRedis2026!}
+      --tcp-backlog 511
+      --timeout 300
+    volumes:
+      - /data/redis:/data
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-WayrecallRedis2026!}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tracker-network
+
+  # ==========================================================
+  # Prometheus — метрики всех сервисов
+  # ==========================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: tracker-prometheus
+    hostname: prometheus
+    restart: unless-stopped
+    user: "65534:65534"
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - /mnt/storage/prometheus:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    networks:
+      - tracker-network
+
+  # ==========================================================
+  # Grafana — дашборды
+  # ==========================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tracker-grafana
+    hostname: grafana
+    restart: unless-stopped
+    user: "472:472"
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-WayrecallGrafana2026!}
+      GF_SERVER_ROOT_URL: "http://${SERVER_IP:-192.168.1.5}:3000"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_INSTALL_PLUGINS: "grafana-clock-panel"
+      TZ: ${TZ:-Europe/Moscow}
+    volumes:
+      - /mnt/storage/grafana:/var/lib/grafana
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    networks:
+      - tracker-network
+
+  # ==========================================================
+  # Node Exporter — метрики хоста (CPU, RAM, Disk, Network)
+  # ==========================================================
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: tracker-node-exporter
+    hostname: node-exporter
+    restart: unless-stopped
+    command:
+      - '--path.rootfs=/host'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /:/host:ro,rslave
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    networks:
+      - tracker-network
+
+networks:
+  tracker-network:
+    name: tracker-network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

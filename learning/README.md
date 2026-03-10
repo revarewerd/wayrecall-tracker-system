@@ -1,6 +1,32 @@
-# 🎓 План глубинного изучения технологий Wayrecall Tracker
+# 🎓 База знаний и обучение — Wayrecall Tracker
 
-> Каждый модуль привязан к реальному коду проекта.
+> Тег: `АКТУАЛЬНО` | Обновлён: `2026-06-06` | Версия: `2.0`
+
+## 📂 Структура learning/
+
+```
+learning/
+├── README.md                          # ← этот файл
+├── STUDY_PLAN_PROJECT.md              # План изучения проекта (6 фаз, 22 дня)
+├── STUDY_PLAN_TECHNOLOGIES.md         # Книги и ресурсы (12 технологий)
+├── fp-in-scala/                       # Упражнения из Red Book (TODO)
+├── interview-prep/                    # Подготовка к собеседованиям
+│   ├── README.md                      # Обзор и ресурсы
+│   ├── algorithms/README.md           # 20 задач на Scala
+│   ├── architecture/README.md         # 10 System Design задач
+│   └── scala-fp/README.md             # Топ-15 вопросов Scala/FP
+└── [модули 01-11]                     # Детальные модули ниже
+```
+
+## 🚀 С чего начать?
+
+1. **[STUDY_PLAN_PROJECT.md](STUDY_PLAN_PROJECT.md)** — как поэтапно изучить весь проект
+2. **[STUDY_PLAN_TECHNOLOGIES.md](STUDY_PLAN_TECHNOLOGIES.md)** — книги и ресурсы по каждой технологии
+3. **[interview-prep/](interview-prep/README.md)** — подготовка к собеседованиям
+
+---
+
+> Каждый модуль ниже привязан к реальному коду проекта.
 > Порядок: от базы к сложному. Не пропускай модули!
 
 ## 📋 Модули
